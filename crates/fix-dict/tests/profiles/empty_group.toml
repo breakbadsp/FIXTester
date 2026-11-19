@@ -1,0 +1,8 @@
+version = "FIX.4.4"
+
+[group.NoLegSecurityAltID]
+count = 604
+members = []
+
+[group.NoLegs]
+count = 555

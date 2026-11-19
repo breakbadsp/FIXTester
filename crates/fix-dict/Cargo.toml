@@ -1,0 +1,15 @@
+[package]
+name = "fix-dict"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "FIX 4.2, 4.3, and 4.4 data dictionaries, venue profiles in TOML, and message validation."
+
+[lints]
+workspace = true
+
+[dependencies]
+fix-codec = { path = "../fix-codec" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"

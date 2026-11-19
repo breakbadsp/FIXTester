@@ -1,0 +1,13 @@
+[package]
+name = "fix-session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The FIX session state machine for FIX 4.2, 4.3, and 4.4. No I/O and no clock."
+
+[lints]
+workspace = true
+
+[dependencies]
+fix-codec = { path = "../fix-codec" }

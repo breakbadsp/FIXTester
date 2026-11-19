@@ -1,0 +1,6 @@
+version = "FIX.4.4"
+
+[defaults]
+HandlInst = "9"
+TimeInForce = "0"
+Price = "abc"

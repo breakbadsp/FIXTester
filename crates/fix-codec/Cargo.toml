@@ -1,0 +1,13 @@
+[package]
+name = "fix-codec"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "FIX tag=value framing, decoding, encoding, repeating groups, and timestamps. No I/O."
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"

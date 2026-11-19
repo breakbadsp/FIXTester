@@ -1,0 +1,13 @@
+[package]
+name = "fix-dict-gen"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Generates the fix-dict tables from the FIX Unified Repository XML. Run by tools/regen-fix-dict.sh."
+
+[lints]
+workspace = true
+
+[dependencies]
+quick-xml = "0.42"

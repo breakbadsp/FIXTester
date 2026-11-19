@@ -1,0 +1,5 @@
+version = "FIX.4.4"
+
+[message.D]
+required = ["Account"]
+forbidden = ["Account", "ClOrdID"]
