@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fix_codec::{Decoder, UtcMillis, tag};
@@ -16,6 +18,7 @@ const PROFILES_MAX: i64 = 128;
 const SCHEMA: &str = include_str!("schema.sql");
 const QUOTA_SCHEMA: &str = include_str!("store/history-quota.sql");
 const TRIM_ROWS: usize = 256;
+const MIGRATION_TRIM_ROWS: usize = 8;
 const MIB: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -23,19 +26,49 @@ struct HistoryLimits {
     soft: usize,
     hard: usize,
     wal_pressure: u64,
+    max_pages: u32,
 }
 
 const LIMITS: HistoryLimits = HistoryLimits {
     soft: 128 * MIB,
     hard: 256 * MIB,
     wal_pressure: 16 * MIB as u64,
+    max_pages: 131_072,
 };
 
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
+    database: PathBuf,
     wal: PathBuf,
     limits: HistoryLimits,
+    pins: Arc<Mutex<BTreeSet<i64>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingWrites {
+    ids: Vec<i64>,
+    pins: Arc<Mutex<BTreeSet<i64>>>,
+}
+
+impl PendingWrites {
+    pub(crate) fn ids(&self) -> &[i64] {
+        &self.ids
+    }
+}
+
+impl Drop for PendingWrites {
+    fn drop(&mut self) {
+        if !self.ids.is_empty() {
+            let mut pins = self
+                .pins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in &self.ids {
+                pins.remove(id);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +130,22 @@ impl Store {
     }
 
     fn open_with_limits(path: &Path, limits: HistoryLimits) -> Result<Self> {
+        Self::connect(path, limits, Arc::default())
+    }
+
+    /// Create another connection for the same locked app instance.
+    pub fn connector(&self) -> impl FnOnce() -> Result<Self> + Send + 'static + use<> {
+        let path = self.database.clone();
+        let limits = self.limits;
+        let pins = Arc::clone(&self.pins);
+        move || Self::connect(&path, limits, pins)
+    }
+
+    fn connect(
+        path: &Path,
+        limits: HistoryLimits,
+        pins: Arc<Mutex<BTreeSet<i64>>>,
+    ) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
         connection.execute_batch(
@@ -104,7 +153,6 @@ impl Store {
              PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
              PRAGMA foreign_keys=ON;
-             PRAGMA max_page_count=131072;
              PRAGMA wal_autocheckpoint=128;
              PRAGMA journal_size_limit=4194304;
              PRAGMA cache_spill=OFF;",
@@ -116,12 +164,25 @@ impl Store {
             ));
         }
 
-        let mut wal = path.as_os_str().to_owned();
-        wal.push("-wal");
+        connection.pragma_update(None, "max_page_count", limits.max_pages)?;
+        let filename = connection
+            .path()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                database_fault(
+                    ffi::SQLITE_IOERR,
+                    "SQLite did not report a usable database filename.",
+                )
+            })?;
+        let database = PathBuf::from(filename);
+        let mut wal = String::from(filename);
+        wal.push_str("-wal");
         let store = Self {
             connection,
+            database,
             wal: PathBuf::from(wal),
             limits,
+            pins,
         };
         store.migrate()?;
         if history_bytes(&store.connection)? > limits.hard {
@@ -131,45 +192,98 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let version = |conn: &Connection| {
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-        };
-        match version(&self.connection)? {
-            0 => {
-                let tx = self.write_transaction()?;
-                if version(&tx)? == 0 {
-                    tx.execute_batch(SCHEMA)?;
-                    tx.execute_batch(QUOTA_SCHEMA)?;
-                }
-                tx.commit()?;
+        while schema_version(&self.connection)? != 1 {
+            let tx = self.write_transaction()?;
+            match schema_version(&tx)? {
+                0 => {}
+                1 => return Ok(()),
+                _ => return Err(invalid("This FIXTester database uses a newer schema.")),
             }
-            1 => {}
-            _ => return Err(invalid("This FIXTester database uses a newer schema.")),
+            let result = tx
+                .execute_batch(SCHEMA)
+                .and_then(|()| tx.execute_batch(QUOTA_SCHEMA));
+            match result {
+                Ok(()) => return Ok(tx.commit()?),
+                Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) => {
+                    // SQLITE_FULL can roll back the transaction itself.
+                    drop(tx);
+                    if !self.reclaim_legacy_pages()? {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
+    }
+
+    fn reclaim_legacy_pages(&self) -> Result<bool> {
+        let tx = self.write_transaction()?;
+        if schema_version(&tx)? != 0 {
+            return Ok(true);
+        }
+        // The next migration attempt can reuse reclaimed pages. A crash can
+        // leave this batch committed with schema version 0, which is safe to retry.
+        let removed = tx.execute(
+            "DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY id LIMIT ?1)",
+            [MIGRATION_TRIM_ROWS],
+        )?;
+        tx.commit()?;
+        Ok(removed != 0)
     }
 
     fn wal_len(&self) -> Result<u64> {
         match std::fs::metadata(&self.wal) {
             Ok(metadata) => Ok(metadata.len()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(database_fault(
+                ffi::SQLITE_IOERR,
+                &format!("Cannot inspect WAL {}: {error}", self.wal.display()),
+            )),
         }
     }
 
     fn write_transaction(&self) -> Result<Transaction<'_>> {
-        if self.wal_len()? >= self.limits.wal_pressure {
-            self.connection
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        for _ in 0..2 {
+            if self.wal_len()? >= self.limits.wal_pressure {
+                self.connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            }
+            let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            if self.wal_len()? < self.limits.wal_pressure {
+                return Ok(tx);
+            }
+            // Another writer can cross the gate before BEGIN gets the lock.
+            // Release the lock before trying a truncate checkpoint again.
+            tx.rollback()?;
         }
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        // Check under SQLite's write lock so other connections cannot race the gate.
-        if self.wal_len()? >= self.limits.wal_pressure {
-            return Err(storage_pressure(
-                "The SQLite WAL is pinned by a reader. Retry after it closes.",
-            ));
+        Err(storage_pressure(
+            "The SQLite WAL remains above the write threshold after checkpoint.",
+        ))
+    }
+
+    fn pinned_ids(&self) -> String {
+        let ids = self
+            .pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!(
+            "[{}]",
+            ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+        )
+    }
+
+    fn protect(&self, ids: Vec<i64>) -> PendingWrites {
+        if !ids.is_empty() {
+            self.pins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(ids.iter().copied());
         }
-        Ok(tx)
+        PendingWrites {
+            ids,
+            pins: Arc::clone(&self.pins),
+        }
     }
 
     pub fn profiles(&self) -> Result<Vec<SavedProfile>> {
@@ -294,19 +408,32 @@ impl Store {
         Ok(format!("FT-{}-{number}", time.0))
     }
 
-    pub(crate) fn commit(&mut self, id: i64, change: &Transition<'_>) -> Result<Vec<i64>> {
+    pub(crate) fn commit(&mut self, id: i64, change: &Transition<'_>) -> Result<PendingWrites> {
         for _ in 0..4 {
             let tx = self.write_transaction()?;
             let before = history_bytes(&tx)?;
+            let last_existing: i64 =
+                tx.query_row("SELECT coalesce(max(id),0) FROM history", [], |row| {
+                    row.get(0)
+                })?;
             let outgoing = Self::record(&tx, id, change)?;
             let after = history_bytes(&tx)?;
             let added = after - before;
             let available = self.limits.hard.checked_sub(added).ok_or_else(|| {
                 storage_pressure("One FIX session transition exceeds the history hard cap.")
             })?;
-            if trim_oldest(&tx, after, self.limits.hard)? {
+            if trim_oldest(
+                &tx,
+                after,
+                self.limits.hard,
+                last_existing,
+                &self.pinned_ids(),
+            )? <= self.limits.hard
+            {
+                // Publish the pins before SQLite releases the lock to another trimmer.
+                let pending = self.protect(outgoing);
                 tx.commit()?;
-                return Ok(outgoing);
+                return Ok(pending);
             }
             tx.rollback()?;
             self.trim_to(available)?;
@@ -351,10 +478,17 @@ impl Store {
     pub(crate) fn finish_write(&self, id: i64, count: usize, complete: bool) -> Result<()> {
         let status = if complete { "Sent" } else { "Write failed" };
         let tx = self.write_transaction()?;
-        tx.execute(
-            "UPDATE history SET status=?1,transferred=?2 WHERE id=?3",
+        let changed = tx.execute(
+            "UPDATE history SET status=?1,transferred=?2
+             WHERE id=?3 AND direction=1 AND status='Unconfirmed'",
             params![status, count, id],
         )?;
+        if changed != 1 {
+            return Err(database_fault(
+                ffi::SQLITE_CORRUPT,
+                &format!("Cannot record write result for history row {id}."),
+            ));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -362,16 +496,17 @@ impl Store {
     /// Returns true when retention and size maintenance have caught up.
     pub fn purge(&self) -> Result<bool> {
         let age_done = self.purge_before(retention_cutoff())?;
-        let size_done = self.trim_batch(self.limits.soft)?;
-        Ok(age_done && size_done)
+        let (_, remaining) = self.trim_batch(self.limits.soft)?;
+        Ok(age_done && remaining <= self.limits.soft)
     }
 
     fn purge_before(&self, cutoff: u64) -> Result<bool> {
         let tx = self.write_transaction()?;
         let removed = tx.execute(
             "DELETE FROM history WHERE id IN (SELECT id FROM history
-             WHERE time_ms<?1 ORDER BY time_ms LIMIT ?2)",
-            params![cutoff, TRIM_ROWS],
+             WHERE time_ms<?1 AND id NOT IN (SELECT value FROM json_each(?2))
+             ORDER BY time_ms LIMIT ?3)",
+            params![cutoff, self.pinned_ids(), TRIM_ROWS],
         )?;
         tx.commit()?;
         Ok(removed < TRIM_ROWS)
@@ -382,8 +517,14 @@ impl Store {
         let excess = history_bytes(&self.connection)?.saturating_sub(target);
         let batches = excess.div_ceil(144 * TRIM_ROWS) + 4;
         for _ in 0..batches {
-            if self.trim_batch(target)? {
+            let (before, remaining) = self.trim_batch(target)?;
+            if remaining <= target {
                 return Ok(());
+            }
+            if remaining == before {
+                return Err(storage_pressure(
+                    "Pending FIX writes occupy the available history quota.",
+                ));
             }
         }
         Err(storage_pressure(
@@ -391,11 +532,12 @@ impl Store {
         ))
     }
 
-    fn trim_batch(&self, target: usize) -> Result<bool> {
+    fn trim_batch(&self, target: usize) -> Result<(usize, usize)> {
         let tx = self.write_transaction()?;
-        let done = trim_oldest(&tx, history_bytes(&tx)?, target)?;
+        let before = history_bytes(&tx)?;
+        let remaining = trim_oldest(&tx, before, target, i64::MAX, &self.pinned_ids())?;
         tx.commit()?;
-        Ok(done)
+        Ok((before, remaining))
     }
 
     pub fn history(&self, id: i64, filter: &Filter, before: Option<i64>) -> Result<Vec<Entry>> {
@@ -487,13 +629,22 @@ impl Store {
     }
 }
 
-fn trim_oldest(tx: &Transaction<'_>, mut bytes: usize, target: usize) -> Result<bool> {
+fn trim_oldest(
+    tx: &Transaction<'_>,
+    mut bytes: usize,
+    target: usize,
+    last_eligible: i64,
+    pins: &str,
+) -> Result<usize> {
     if bytes <= target {
-        return Ok(true);
+        return Ok(bytes);
     }
     let last = {
-        let mut query = tx.prepare("SELECT id,charge FROM history ORDER BY id LIMIT ?1")?;
-        let mut rows = query.query([TRIM_ROWS])?;
+        let mut query = tx.prepare(
+            "SELECT id,charge FROM history WHERE id<=?1
+            AND id NOT IN (SELECT value FROM json_each(?2)) ORDER BY id LIMIT ?3",
+        )?;
+        let mut rows = query.query(params![last_eligible, pins, TRIM_ROWS])?;
         let mut last = None;
         while let Some(row) = rows.next()? {
             last = Some(row.get::<_, i64>(0)?);
@@ -502,14 +653,27 @@ fn trim_oldest(tx: &Transaction<'_>, mut bytes: usize, target: usize) -> Result<
                 break;
             }
         }
-        last.ok_or_else(|| invalid("History quota does not match the stored rows."))?
+        last
     };
-    tx.execute("DELETE FROM history WHERE id<=?1", [last])?;
-    Ok(bytes <= target)
+    if let Some(last) = last {
+        tx.execute(
+            "DELETE FROM history WHERE id<=?1 AND id NOT IN (SELECT value FROM json_each(?2))",
+            params![last, pins],
+        )?;
+    }
+    Ok(bytes)
+}
+
+fn schema_version(connection: &Connection) -> rusqlite::Result<u32> {
+    connection.query_row("PRAGMA user_version", [], |row| row.get(0))
+}
+
+fn database_fault(code: i32, message: &str) -> crate::Error {
+    rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some(message.into())).into()
 }
 
 fn storage_pressure(message: &str) -> crate::Error {
-    rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_FULL), Some(message.into())).into()
+    database_fault(ffi::SQLITE_FULL, message)
 }
 
 fn history_bytes(connection: &Connection) -> Result<usize> {

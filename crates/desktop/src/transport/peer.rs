@@ -271,7 +271,7 @@ impl Peer<'_> {
         let outgoing = frames(&self.output)?;
         let had_io = received.is_some() || !outgoing.is_empty();
         if had_io {
-            let ids = self.store.commit(
+            let pending = self.store.commit(
                 self.saved.id,
                 &Transition {
                     time,
@@ -288,8 +288,12 @@ impl Peer<'_> {
                     values,
                 },
             )?;
-            let result =
-                write_outgoing(&mut self.stream, self.store, outgoing.into_iter().zip(ids));
+            let result = write_outgoing(
+                &mut self.stream,
+                self.store,
+                outgoing.into_iter().zip(pending.ids().iter().copied()),
+            );
+            drop(pending);
             self.control.update(|status| {
                 status.seq = seq;
                 status.revision += 1;
@@ -465,7 +469,8 @@ mod tests {
         let mut wire = BrokenWire {
             written: Vec::new(),
         };
-        assert!(write_outgoing(&mut wire, &store, [(raw.as_slice(), rows[0])]).is_err());
+        assert!(write_outgoing(&mut wire, &store, [(raw.as_slice(), rows.ids()[0])]).is_err());
+        drop(rows);
         drop(store);
 
         let reopened = Store::open(&path).unwrap();

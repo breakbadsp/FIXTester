@@ -125,7 +125,7 @@ const FIXTURE_CHARGE: usize = 144 + 8;
 const SMALL: HistoryLimits = HistoryLimits {
     soft: 2 * FIXTURE_CHARGE,
     hard: 3 * FIXTURE_CHARGE,
-    wal_pressure: LIMITS.wal_pressure,
+    ..LIMITS
 };
 
 #[test]
@@ -303,9 +303,228 @@ fn wire_text_and_payload_share_the_quota_with_transfer_metadata() {
         )
         .unwrap();
     assert_eq!(history_bytes(&store.connection).unwrap(), charge);
-    store.finish_write(rows[0], 5, false).unwrap();
+    store.finish_write(rows.ids()[0], 5, false).unwrap();
     assert_eq!(history_bytes(&store.connection).unwrap(), charge);
     let history = store.history(id, &Filter::default(), None).unwrap();
     assert_eq!(history[0].transferred, 5);
     assert_eq!(history[0].raw, raw);
+}
+
+#[test]
+fn in_flight_rows_survive_retention_and_quota_from_another_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pinned.db");
+    let mut sender = Store::open_with_limits(&path, SMALL).unwrap();
+    let mut other = sender.connector()().unwrap();
+    let id = sender.save_profile(None, &profile(1)).unwrap();
+    let other_id = other.save_profile(None, &profile(2)).unwrap();
+    let checkpoint = sender.checkpoint(id).unwrap();
+    let time = now();
+    let pending = sender
+        .commit(
+            id,
+            &Transition {
+                time,
+                checkpoint,
+                received: None,
+                outgoing: &[b"pending1", b"pending2", b"pending3"],
+                values: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(history_bytes(&sender.connection).unwrap(), SMALL.hard);
+    assert!(other.purge_before(time.0 + 1).unwrap());
+    other.purge().unwrap();
+    assert_eq!(
+        stored_bytes(&other, id),
+        [b"pending3", b"pending2", b"pending1"]
+    );
+    let error = append(&mut other, other_id, time, b"new-data", 2).unwrap_err();
+    assert!(error.to_string().contains("Pending FIX writes"));
+    assert_eq!(other.checkpoint(other_id).unwrap().seq.next_sender, 1);
+
+    sender.finish_write(pending.ids()[0], 8, true).unwrap();
+    assert!(sender.finish_write(pending.ids()[0], 8, true).is_err());
+    // The other frames did not reach TCP. Dropping the failed batch unpins them.
+    drop(pending);
+    append(&mut other, other_id, time, b"new-data", 2).unwrap();
+    let rows = other.history(id, &Filter::default(), None).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status == "Unconfirmed"));
+    assert!(other.purge_before(time.0 + 1).unwrap());
+    assert_eq!(stored_bytes(&sender, id).len(), 0);
+    assert!(sender.finish_write(-1, 0, false).is_err());
+}
+
+#[test]
+fn interrupted_send_is_not_pinned_after_the_app_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("restart.db");
+    let time = now();
+    let mut old = Store::open_with_limits(&db, SMALL).unwrap();
+    let id = old.save_profile(None, &profile(1)).unwrap();
+    let pending = old
+        .commit(
+            id,
+            &Transition {
+                time,
+                checkpoint: old.checkpoint(id).unwrap(),
+                received: None,
+                outgoing: &[b"pending1"],
+                values: None,
+            },
+        )
+        .unwrap();
+    drop(old);
+
+    // A new app instance has no previous in-memory pins.
+    let reopened = Store::open_with_limits(&db, SMALL).unwrap();
+    assert_eq!(
+        reopened.history(id, &Filter::default(), None).unwrap()[0].status,
+        "Unconfirmed"
+    );
+    assert!(reopened.purge_before(time.0 + 1).unwrap());
+    assert_eq!(stored_bytes(&reopened, id).len(), 0);
+    drop(pending);
+}
+
+#[test]
+fn full_legacy_database_reclaims_history_pages_before_quota_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("full-legacy.db");
+    let limits = HistoryLimits {
+        max_pages: 32,
+        ..LIMITS
+    };
+    let legacy = Connection::open(&path).unwrap();
+    legacy.pragma_update(None, "page_size", 4096).unwrap();
+    legacy
+        .pragma_update(None, "max_page_count", limits.max_pages)
+        .unwrap();
+    legacy.execute_batch(SCHEMA).unwrap();
+    legacy.execute(
+        "INSERT INTO profile(id,name,version,sender,target,role,address,heartbeat,next_send,next_receive,reset)
+         VALUES(1,'Old profile','FIX.4.4','US','THEM',0,'127.0.0.1:9876',30,21,51,1)", [],
+    ).unwrap();
+    let insert = "INSERT INTO history(profile,time_ms,direction,kind,seq,summary,status,raw,transferred,application)
+                  VALUES(1,?1,0,'','','','Incomplete frame',?2,4096,0)";
+    let raw = vec![b'x'; 4096];
+    let mut total = 0;
+    for _ in 0..limits.max_pages {
+        match legacy.execute(insert, params![now().0, raw]) {
+            Ok(_) => total += 1,
+            Err(error) => {
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DiskFull)
+                );
+                break;
+            }
+        }
+    }
+    assert!(total > MIGRATION_TRIM_ROWS);
+    let first_attempt = legacy.unchecked_transaction().unwrap();
+    assert_eq!(
+        first_attempt
+            .execute_batch(QUOTA_SCHEMA)
+            .unwrap_err()
+            .sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DiskFull)
+    );
+    drop(first_attempt);
+    assert_eq!(schema_version(&legacy).unwrap(), 0);
+    drop(legacy);
+
+    for _ in 0..2 {
+        let store = Store::open_with_limits(&path, limits).unwrap();
+        assert_eq!(schema_version(&store.connection).unwrap(), 1);
+        let retained = store.history(1, &Filter::default(), None).unwrap();
+        assert_eq!(retained.len(), total - MIGRATION_TRIM_ROWS);
+        assert_eq!(
+            retained.last().unwrap().id,
+            i64::try_from(MIGRATION_TRIM_ROWS + 1).unwrap()
+        );
+        let saved = store.checkpoint(1).unwrap();
+        assert_eq!(saved.seq.next_sender, 21);
+        assert_eq!(saved.seq.next_target, 51);
+        assert!(saved.reset);
+        assert_eq!(store.profiles().unwrap()[0].profile.name, "Old profile");
+    }
+}
+
+#[test]
+fn symlink_uses_sqlites_wal_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let actual = dir.path().join("actual.db");
+    let alias = dir.path().join("alias.db");
+    let real = Store::open(&actual).unwrap();
+    std::os::unix::fs::symlink(&actual, &alias).unwrap();
+    let mut linked = Store::open(&alias).unwrap();
+    linked.save_profile(None, &profile(1)).unwrap();
+    assert_eq!(linked.wal, real.wal);
+    assert!(linked.wal_len().unwrap() > 0);
+    assert_eq!(linked.wal_len().unwrap(), real.wal_len().unwrap());
+}
+
+#[test]
+fn wal_metadata_fault_has_a_database_error_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("metadata.db")).unwrap();
+    let id = store.save_profile(None, &profile(1)).unwrap();
+    let broken = dir.path().join("metadata-loop");
+    std::os::unix::fs::symlink(&broken, &broken).unwrap();
+    store.wal = broken;
+    let err = append(&mut store, id, now(), b"received", 2).unwrap_err();
+    let crate::Error::Database(error) = err else {
+        panic!("Expected a database error, got {err}")
+    };
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::SystemIoFailure)
+    );
+    assert!(error.to_string().contains("metadata-loop"));
+    assert!(error.to_string().contains("os error"));
+    assert_eq!(store.checkpoint(id).unwrap().seq.next_sender, 1);
+}
+
+#[test]
+fn wal_crossing_threshold_before_write_lock_retries_after_checkpoint() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("race.db");
+    let limits = HistoryLimits {
+        wal_pressure: 48 * 1024,
+        ..LIMITS
+    };
+    let holder = Store::open(&db).unwrap();
+    let mut waiter = Store::open_with_limits(&db, limits).unwrap();
+    let id = truncate_checkpoint(&holder);
+    assert_eq!(id, (0, 0, 0));
+    waiter
+        .connection
+        .busy_handler(Some(|n| {
+            WAITING.store(true, Ordering::Release);
+            thread::sleep(Duration::from_millis(1));
+            n < 3000
+        }))
+        .unwrap();
+    let lock = holder.write_transaction().unwrap();
+    let thread = thread::spawn(move || waiter.save_profile(None, &profile(1)));
+    let start = std::time::Instant::now();
+    while !WAITING.load(Ordering::Acquire) {
+        assert!(start.elapsed() < Duration::from_secs(3));
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Dirty enough pages to move the WAL past the gate before the waiter gets the lock.
+    lock.execute_batch(
+        "CREATE TABLE wal_race_fixture(bytes BLOB);
+        INSERT INTO wal_race_fixture VALUES(zeroblob(65536));",
+    )
+    .unwrap();
+    lock.commit().unwrap();
+    let saved = thread.join().unwrap().unwrap();
+    assert_eq!(holder.profiles().unwrap()[0].id, saved);
+    assert!(holder.wal_len().unwrap() < limits.wal_pressure);
 }

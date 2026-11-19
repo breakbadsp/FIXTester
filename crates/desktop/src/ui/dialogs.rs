@@ -8,7 +8,7 @@ use fix_session::Role;
 use fixtester_desktop::model::{
     Application, FIELDS_MAX, MESSAGE_MAX, Order, OrderKind, OrderValues, Profile,
 };
-use fixtester_desktop::store::{Direction, SavedProfile, Store};
+use fixtester_desktop::store::{Direction, SavedProfile};
 use fixtester_desktop::transport::Send;
 use fixtester_desktop::{Result, invalid};
 
@@ -445,15 +445,13 @@ impl Workspace {
             return Err(invalid("Enter an export path."));
         }
         let file = PathBuf::from(filename);
-        let database = self.path.clone();
+        let open = self.store.connector();
         let filter = self.filter.clone();
         let (tx, rx) = sync_channel(1);
         std::thread::Builder::new()
             .name("fix-export".into())
             .spawn(move || {
-                let _ = tx.send(
-                    Store::open(&database).and_then(|store| store.export(id, &filter, &file)),
-                );
+                let _ = tx.send(open().and_then(|store| store.export(id, &filter, &file)));
             })?;
         self.exporting = Some(rx);
         Ok(())

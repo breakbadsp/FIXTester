@@ -2,7 +2,6 @@ mod peer;
 
 use std::collections::BTreeMap;
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
     Arc, Mutex,
@@ -86,20 +85,12 @@ impl Worker {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Sessions {
-    path: PathBuf,
     workers: BTreeMap<i64, Worker>,
 }
 
 impl Sessions {
-    pub fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_owned(),
-            workers: BTreeMap::new(),
-        }
-    }
-
     pub fn count(&self) -> usize {
         self.workers
             .values()
@@ -125,7 +116,7 @@ impl Sessions {
             ));
         }
         let checkpoint = store.checkpoint(saved.id)?;
-        let path = self.path.clone();
+        let open = store.connector();
         let id = saved.id;
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(Status {
@@ -141,7 +132,7 @@ impl Sessions {
         let thread = thread::Builder::new()
             .name(format!("fix-session-{id}"))
             .spawn(move || {
-                let result = run(&path, &saved, &control);
+                let result = open().and_then(|mut store| run(&mut store, &saved, &control));
                 control.update(|status| {
                     status.phase = Phase::Stopped;
                     if let Err(error) = result {
@@ -233,18 +224,17 @@ impl Control {
     }
 }
 
-fn run(path: &Path, saved: &SavedProfile, control: &Control) -> Result<()> {
-    let mut store = Store::open(path)?;
+fn run(store: &mut Store, saved: &SavedProfile, control: &Control) -> Result<()> {
     match saved.profile.role {
         Role::Initiator => {
             let stream =
                 TcpStream::connect_timeout(&saved.profile.address, Duration::from_secs(3))?;
             if !control.stopping() {
-                peer::connect(stream, &mut store, saved, control)?;
+                peer::connect(stream, store, saved, control)?;
             }
             Ok(())
         }
-        Role::Acceptor => listen(&mut store, saved, control),
+        Role::Acceptor => listen(store, saved, control),
     }
 }
 

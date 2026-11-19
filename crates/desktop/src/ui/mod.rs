@@ -1,7 +1,7 @@
 mod dialogs;
 mod timeline;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -49,7 +49,6 @@ pub fn style(ctx: &egui::Context) {
 
 pub struct Workspace {
     store: Store,
-    path: PathBuf,
     sessions: Sessions,
     profiles: Vec<SavedProfile>,
     selected: Option<i64>,
@@ -77,8 +76,7 @@ impl Workspace {
         let selected = profiles.first().map(|profile| profile.id);
         Ok(Self {
             store,
-            path: path.to_owned(),
-            sessions: Sessions::new(path),
+            sessions: Sessions::default(),
             profiles,
             selected,
             entries: Vec::new(),

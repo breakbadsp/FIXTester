@@ -92,7 +92,7 @@ fn order_flow_over_tcp_in_every_version_and_role() {
             let listener = (role == Role::Initiator).then_some(listener);
             let (db, store, saved) = setup(dir.path(), profile(role, version, address, 1));
             let id = saved.id;
-            let mut sessions = Sessions::new(&db);
+            let mut sessions = Sessions::default();
             sessions.start(&store, saved.clone()).unwrap();
             let mut wire = connect(&sessions, &saved, listener.as_ref());
             handshake(&sessions, id, &mut wire, 1, 1, false);
@@ -229,7 +229,7 @@ fn restart_gap_fill_peer_reset_rejection_and_confirmed_reset() {
         ),
     );
     let id = saved.id;
-    let mut sessions = Sessions::new(&db);
+    let mut sessions = Sessions::default();
     sessions.start(&store, saved.clone()).unwrap();
     let mut wire = connect(&sessions, &saved, Some(&listener));
     handshake(&sessions, id, &mut wire, 1, 1, false);
@@ -254,7 +254,7 @@ fn restart_gap_fill_peer_reset_rejection_and_confirmed_reset() {
     drop(store);
 
     let store = Store::open(&db).unwrap();
-    let mut sessions = Sessions::new(&db);
+    let mut sessions = Sessions::default();
     sessions.start(&store, saved.clone()).unwrap();
     let mut wire = connect(&sessions, &saved, Some(&listener));
     handshake(&sessions, id, &mut wire, 3, 2, false);
@@ -309,7 +309,7 @@ fn eight_active_sessions_in_a_mix_and_unique_identity() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
     let mut store = Store::open(&db).unwrap();
-    let mut sessions = Sessions::new(&db);
+    let mut sessions = Sessions::default();
     let mut peers = Vec::new();
     for index in 0..8 {
         let role = if index % 2 == 0 {
@@ -353,9 +353,9 @@ fn acceptor_requires_armed_reset_and_reconnects_after_heartbeat_timeout() {
         1,
     );
     profile.heartbeat = 1;
-    let (db, store, saved) = setup(dir.path(), profile);
+    let (_db, store, saved) = setup(dir.path(), profile);
     let id = saved.id;
-    let mut sessions = Sessions::new(&db);
+    let mut sessions = Sessions::default();
     sessions.reset(&store, id).unwrap();
     sessions.start(&store, saved.clone()).unwrap();
     let mut wrong_peer = connect(&sessions, &saved, None);
@@ -392,7 +392,7 @@ fn acceptor_requires_armed_reset_and_reconnects_after_heartbeat_timeout() {
 fn checksum_error_preserves_the_following_frame_and_requests_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let listener = reserve();
-    let (db, store, saved) = setup(
+    let (_db, store, saved) = setup(
         dir.path(),
         profile(
             Role::Initiator,
@@ -402,7 +402,7 @@ fn checksum_error_preserves_the_following_frame_and_requests_recovery() {
         ),
     );
     let id = saved.id;
-    let mut sessions = Sessions::new(&db);
+    let mut sessions = Sessions::default();
     sessions.start(&store, saved.clone()).unwrap();
     let mut peer = connect(&sessions, &saved, Some(&listener));
     handshake(&sessions, id, &mut peer, 1, 1, false);

@@ -103,8 +103,11 @@ only. Use **Raw** to display exact bytes with `\xNN` escapes. **Export…**
 writes matching captured bytes from one database snapshot in timeline
 order to a new file and keeps the SOH bytes. It includes any captured
 fragment. A partial write exports only the prefix that TCP accepted.
-An unconfirmed send keeps the planned frame for inspection. TCP write
-success does not prove peer receipt. Export captures at most 256 MiB of
+An unconfirmed send keeps the planned frame for inspection. Retention
+and size trimming skip frames while their write batch is active. After a
+batch ends or the app restarts, its remaining unconfirmed rows can be
+trimmed. If in-flight frames fill the quota, the next send fails before
+it writes to TCP. TCP write success does not prove peer receipt. Export captures at most 256 MiB of
 bytes in 1 MiB memory chunks. FIXTester releases the SQLite read
 snapshot before it writes to the destination. One export runs at a
 time. Its temporary output file is also at most 256 MiB.
@@ -121,8 +124,10 @@ row is the raw payload length, the byte lengths of MsgType, sequence
 text, and summary, at least 16 bytes for status, and 128 bytes for the
 six integer columns and a fixed metadata allowance. This charge is
 independent of SQLite page allocation. On first open, FIXTester charges
-existing rows and trims an over-limit database. Trimming keeps the
-profiles, sequence checkpoints, and remembered order values.
+existing rows and trims an over-limit database. If the legacy database
+has no room for the quota schema, FIXTester removes oldest history in
+small batches to free pages. Trimming keeps the profiles, sequence
+checkpoints, and remembered order values.
 
 SQLite limits the main database to 131,072 pages of 4096 bytes
 (512 MiB). Deleted pages can be reused. Deletion does not shrink the
@@ -131,8 +136,9 @@ the WAL, the shared-memory index, and export files. SQLite attempts an
 automatic checkpoint after 128 WAL pages and aims to leave at most
 4 MiB of recycled WAL space. If the WAL reaches 16 MiB, FIXTester tries
 a truncate checkpoint before the next write. It checks again under the
-SQLite write lock and returns a storage error if the WAL is still at
-the threshold. One bounded transaction can take the WAL past that
+SQLite write lock. If a concurrent writer crosses the threshold,
+FIXTester releases the lock and retries the checkpoint before it reports
+a storage error. One bounded transaction can take the WAL past that
 threshold. Export destination writes hold no database read snapshot.
 
 The database supports 128 profiles and remembers up to 256 symbols per
