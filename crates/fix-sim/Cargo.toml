@@ -1,0 +1,18 @@
+[package]
+name = "fix-sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "A deterministic simulator for two FIX sessions on a faulty simulated network."
+
+[lints]
+workspace = true
+
+[dependencies]
+fix-codec = { path = "../fix-codec" }
+fix-session = { path = "../fix-session" }
+
+[[bin]]
+name = "fix_sim"
+path = "src/bin/fix_sim.rs"

@@ -1,0 +1,5 @@
+version = "FIX.4.4"
+
+[group.NoVenueLegs]
+count = 555
+members = [600, "NoLegSecurityAltID"]

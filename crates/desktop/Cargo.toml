@@ -1,0 +1,19 @@
+[package]
+name = "fixtester-desktop"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+eframe = { version = "0.37.0", default-features = false, features = [
+  "accesskit",
+  "clipboard",
+  "default_fonts",
+  "glow",
+  "wayland",
+  "x11",
+] }

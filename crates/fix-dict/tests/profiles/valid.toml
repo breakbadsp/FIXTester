@@ -1,0 +1,26 @@
+version = "FIX.4.4"
+
+[defaults]
+HandlInst = "1"
+Account = "TEST01"
+
+[[field]]
+tag = 9001
+name = "VenueStrategy"
+type = "STRING"
+values = ["VWAP", "TWAP"]
+
+[message.D]
+required = ["Account", 9001]
+forbidden = ["ExDestination"]
+
+[group.NoLegs]
+count = 555          # NumInGroup tag
+members = [600, 608, 624, 654, "NoLegSecurityAltID"]
+
+[group.NoLegSecurityAltID]
+count = 604
+members = [605, 606]
+
+[message.AB]
+add = ["NoLegs"]
