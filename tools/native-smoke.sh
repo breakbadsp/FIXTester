@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 mode=${1:-host}
 if [[ "$mode" == host ]]; then
     cargo build --locked -p fixtester-desktop --example native_smoke
-    timeout 20 "${CARGO_TARGET_DIR:-target}/debug/examples/native_smoke"
+    timeout 20 cargo run --locked -p fixtester-desktop --example native_smoke
     exit
 fi
 
@@ -19,6 +19,7 @@ trap 'rm -rf -- "$tmp"' EXIT
 toolchain=$(dirname "$(dirname "$(rustup which rustc)")")
 cargo_cache=${CARGO_HOME:-$HOME/.cargo}
 container=${FIXTESTER_CONTAINER:-podman}
+mkdir -p "$cargo_cache/registry"
 
 "$container" build -t localhost/fixtester-smoke-build:8 -f - "$tmp" <<'DOCKERFILE'
 FROM docker.io/library/almalinux:8
@@ -43,7 +44,7 @@ for version in 8 9; do
     image="localhost/fixtester-smoke-display:$version"
     "$container" build -t "$image" -f - "$tmp" <<DOCKERFILE
 FROM docker.io/library/almalinux:$version
-RUN dnf -y install xorg-x11-server-Xvfb mesa-libEGL mesa-libGL mesa-dri-drivers libxkbcommon libXcursor libXi libXrandr libXinerama && dnf clean all
+RUN dnf -y install xorg-x11-server-Xvfb mesa-libEGL mesa-libGL mesa-dri-drivers libxkbcommon-x11 libXcursor libXi libXrandr libXinerama && dnf clean all
 DOCKERFILE
     "$container" run --rm -v "$binary:/native-smoke:ro" "$image" \
         bash -ec 'cat /etc/almalinux-release
