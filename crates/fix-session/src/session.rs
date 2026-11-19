@@ -129,6 +129,24 @@ impl Default for SequenceNumbers {
     }
 }
 
+/// Time for one session event. The host supplies both clocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTime {
+    /// Milliseconds from a fixed monotonic origin.
+    pub elapsed_ms: u64,
+    /// UTC for FIX timestamps and SendingTime checks.
+    pub utc: UtcMillis,
+}
+
+impl SessionTime {
+    fn legacy(utc: UtcMillis) -> Self {
+        Self {
+            elapsed_ms: utc.0,
+            utc,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     config: Config,
@@ -137,16 +155,16 @@ pub struct Session {
     /// Heartbeat interval in use: from the config, or from the peer Logon.
     heartbeat_ms: u64,
     /// When the state started: for the Logon and Logout timeouts.
-    state_since: UtcMillis,
-    last_sent: UtcMillis,
-    last_received: UtcMillis,
+    state_since: u64,
+    last_sent: u64,
+    last_received: u64,
     /// The TestReqID and time of a TestRequest that has no reply yet.
-    test_request: Option<(u64, UtcMillis)>,
+    test_request: Option<(u64, u64)>,
     /// The highest MsgSeqNum seen while a ResendRequest is open.
     gap_until: Option<u64>,
     /// When the last ResendRequest was sent. A gap that stays open for one
     /// heartbeat interval gets a new ResendRequest, in case one was lost.
-    resend_sent: UtcMillis,
+    resend_sent: u64,
     /// The initiator sent ResetSeqNumFlag=Y and waits for the reply.
     reset_requested: bool,
     encoder: Encoder,
@@ -173,12 +191,12 @@ impl Session {
             config,
             state: State::Disconnected,
             seq,
-            state_since: UtcMillis(0),
-            last_sent: UtcMillis(0),
-            last_received: UtcMillis(0),
+            state_since: 0,
+            last_sent: 0,
+            last_received: 0,
             test_request: None,
             gap_until: None,
-            resend_sent: UtcMillis(0),
+            resend_sent: 0,
             reset_requested: false,
             encoder,
             output,
@@ -223,12 +241,16 @@ impl Session {
 
     /// The connection is open. The initiator sends Logon.
     pub fn on_connected(&mut self, now: UtcMillis) {
+        self.on_connected_at(SessionTime::legacy(now));
+    }
+
+    pub fn on_connected_at(&mut self, now: SessionTime) {
         assert_eq!(
             self.state,
             State::Disconnected,
             "on_connected without on_disconnected"
         );
-        self.last_received = now;
+        self.last_received = now.elapsed_ms;
         self.test_request = None;
         self.gap_until = None;
         match self.config.role {
@@ -247,6 +269,10 @@ impl Session {
 
     /// The connection is closed.
     pub fn on_disconnected(&mut self, now: UtcMillis) {
+        self.on_disconnected_at(SessionTime::legacy(now));
+    }
+
+    pub fn on_disconnected_at(&mut self, now: SessionTime) {
         self.output.clear();
         self.test_request = None;
         self.gap_until = None;
@@ -256,6 +282,10 @@ impl Session {
     /// Starts a Logout. The session waits for the reply, then asks the host to
     /// disconnect.
     pub fn logout(&mut self, now: UtcMillis, text: &[u8]) {
+        self.logout_at(SessionTime::legacy(now), text);
+    }
+
+    pub fn logout_at(&mut self, now: SessionTime, text: &[u8]) {
         if self.state != State::Active {
             return;
         }
@@ -269,6 +299,15 @@ impl Session {
     pub fn send_app(
         &mut self,
         now: UtcMillis,
+        msg_type: &[u8],
+        fill: impl FnOnce(&mut Body),
+    ) -> Result<u64, SendError> {
+        self.send_app_at(SessionTime::legacy(now), msg_type, fill)
+    }
+
+    pub fn send_app_at(
+        &mut self,
+        now: SessionTime,
         msg_type: &[u8],
         fill: impl FnOnce(&mut Body),
     ) -> Result<u64, SendError> {
@@ -288,7 +327,12 @@ impl Session {
     /// The time when [`Session::on_timer`] must run next, or `None` when no
     /// timer is due.
     pub fn next_deadline(&self) -> Option<UtcMillis> {
-        let after = |since: UtcMillis, ms: u64| UtcMillis(since.0 + ms);
+        self.next_deadline_ms().map(UtcMillis)
+    }
+
+    /// Returns the deadline in milliseconds from the host's monotonic origin.
+    pub fn next_deadline_ms(&self) -> Option<u64> {
+        let after = u64::saturating_add;
         match self.state {
             State::Disconnected | State::Disconnecting => None,
             State::LogonSent | State::AwaitingLogon => {
@@ -314,7 +358,11 @@ impl Session {
 
     /// Runs the timers: heartbeats, TestRequests, and the timeouts.
     pub fn on_timer(&mut self, now: UtcMillis) {
-        let since = now.0.saturating_sub(self.state_since.0);
+        self.on_timer_at(SessionTime::legacy(now));
+    }
+
+    pub fn on_timer_at(&mut self, now: SessionTime) {
+        let since = now.elapsed_ms.saturating_sub(self.state_since);
         match self.state {
             State::Disconnected | State::Disconnecting => {}
             State::LogonSent | State::AwaitingLogon => {
@@ -331,37 +379,42 @@ impl Session {
         }
     }
 
-    fn check_heartbeats(&mut self, now: UtcMillis) {
-        let silent_ms = now.0.saturating_sub(self.last_received.0);
+    fn check_heartbeats(&mut self, now: SessionTime) {
+        let silent_ms = now.elapsed_ms.saturating_sub(self.last_received);
         match self.test_request {
-            Some((_, sent)) if now.0.saturating_sub(sent.0) >= self.heartbeat_ms => {
+            Some((_, sent)) if now.elapsed_ms.saturating_sub(sent) >= self.heartbeat_ms => {
                 self.request_disconnect(DisconnectReason::HeartbeatTimeout, now);
                 return;
             }
             None if silent_ms >= self.heartbeat_ms + self.heartbeat_ms / 5 => {
-                let id = now.0;
+                let id = now.elapsed_ms;
                 self.send(now, msg_type::TEST_REQUEST, |body| {
                     body.field_u64(tag::TEST_REQ_ID, id);
                 });
-                self.test_request = Some((id, now));
+                self.test_request = Some((id, now.elapsed_ms));
             }
             _ => {}
         }
-        if self.gap_until.is_some() && now.0.saturating_sub(self.resend_sent.0) >= self.heartbeat_ms
+        if self.gap_until.is_some()
+            && now.elapsed_ms.saturating_sub(self.resend_sent) >= self.heartbeat_ms
         {
             self.send_resend_request(now);
         }
-        if now.0.saturating_sub(self.last_sent.0) >= self.heartbeat_ms {
+        if now.elapsed_ms.saturating_sub(self.last_sent) >= self.heartbeat_ms {
             self.send(now, msg_type::HEARTBEAT, |_| {});
         }
     }
 
     /// Processes one received message.
     pub fn on_message(&mut self, now: UtcMillis, message: &Message) -> Disposition {
+        self.on_message_at(SessionTime::legacy(now), message)
+    }
+
+    pub fn on_message_at(&mut self, now: SessionTime, message: &Message) -> Disposition {
         if matches!(self.state, State::Disconnected | State::Disconnecting) {
             return Disposition::Drop;
         }
-        self.last_received = now;
+        self.last_received = now.elapsed_ms;
         let fields = message.fields();
         let kind = message.msg_type();
         let Some(seq) = fields.get_u64(tag::MSG_SEQ_NUM).filter(|seq| *seq >= 1) else {
@@ -402,7 +455,7 @@ impl Session {
 
     fn on_message_before_logon(
         &mut self,
-        now: UtcMillis,
+        now: SessionTime,
         kind: &[u8],
         fields: &Fields,
         seq: u64,
@@ -415,7 +468,7 @@ impl Session {
             self.request_disconnect(DisconnectReason::BadLogon, now);
             return Disposition::Drop;
         }
-        if let Some(text) = self.logon_problem(now, fields) {
+        if let Some(text) = self.logon_problem(now.utc, fields) {
             self.fatal_logout(now, text, DisconnectReason::BadLogon);
             return Disposition::Drop;
         }
@@ -454,8 +507,14 @@ impl Session {
 
     /// Checks the standard header. On a problem it sends Reject (and Logout
     /// for a CompID or SendingTime problem), and returns false.
-    fn header_is_valid(&mut self, now: UtcMillis, kind: &[u8], fields: &Fields, seq: u64) -> bool {
-        let Err(problem) = self.check_header(now, fields) else {
+    fn header_is_valid(
+        &mut self,
+        now: SessionTime,
+        kind: &[u8],
+        fields: &Fields,
+        seq: u64,
+    ) -> bool {
+        let Err(problem) = self.check_header(now.utc, fields) else {
             return true;
         };
         // A rejected message still uses its MsgSeqNum: the peer must not
@@ -547,7 +606,7 @@ impl Session {
 
     /// Returns true when `seq` is the expected MsgSeqNum. Handles a gap, a
     /// possible duplicate, and a MsgSeqNum that is too low.
-    fn sequence_is_next(&mut self, now: UtcMillis, fields: &Fields, seq: u64) -> bool {
+    fn sequence_is_next(&mut self, now: SessionTime, fields: &Fields, seq: u64) -> bool {
         let expected = self.seq.next_target;
         if seq > expected {
             if self.gap_until.is_none() {
@@ -574,7 +633,7 @@ impl Session {
 
     fn on_next_message(
         &mut self,
-        now: UtcMillis,
+        now: SessionTime,
         kind: &[u8],
         fields: &Fields,
         seq: u64,
@@ -619,7 +678,7 @@ impl Session {
         }
     }
 
-    fn on_test_request(&mut self, now: UtcMillis, fields: &Fields, seq: u64) {
+    fn on_test_request(&mut self, now: SessionTime, fields: &Fields, seq: u64) {
         let Some(id) = fields.get(tag::TEST_REQ_ID) else {
             self.reject(
                 now,
@@ -638,7 +697,7 @@ impl Session {
 
     /// Handles a SequenceReset. In reset mode MsgSeqNum is not checked. In
     /// gap fill mode the caller checked that `seq` is the expected one.
-    fn on_sequence_reset(&mut self, now: UtcMillis, kind: &[u8], fields: &Fields, seq: u64) {
+    fn on_sequence_reset(&mut self, now: SessionTime, kind: &[u8], fields: &Fields, seq: u64) {
         let gap_fill = fields.get_bool(tag::GAP_FILL_FLAG) == Some(true);
         let Some(new_seq) = fields.get_u64(tag::NEW_SEQ_NO) else {
             self.reject(
@@ -676,7 +735,7 @@ impl Session {
     }
 
     /// Answers a ResendRequest with one gap fill for the requested range (R17).
-    fn on_resend_request(&mut self, now: UtcMillis, fields: &Fields, seq: u64) {
+    fn on_resend_request(&mut self, now: SessionTime, fields: &Fields, seq: u64) {
         let Some(begin) = fields.get_u64(tag::BEGIN_SEQ_NO) else {
             self.reject(
                 now,
@@ -717,7 +776,7 @@ impl Session {
             (end + 1).min(next_sender)
         };
         let mut time = [0u8; 21];
-        let sending_time = write_utc_timestamp(now, &mut time);
+        let sending_time = write_utc_timestamp(now.utc, &mut time);
         let written = self.write_message(now, msg_type::SEQUENCE_RESET, begin, |body| {
             body.field_bool(tag::POSS_DUP_FLAG, true)
                 .field(tag::ORIG_SENDING_TIME, sending_time)
@@ -735,7 +794,7 @@ impl Session {
         });
     }
 
-    fn open_gap(&mut self, now: UtcMillis, received: u64) {
+    fn open_gap(&mut self, now: SessionTime, received: u64) {
         let begin = self.seq.next_target;
         self.gap_until = Some(received);
         self.send_resend_request(now);
@@ -743,13 +802,13 @@ impl Session {
     }
 
     /// Asks for all messages from the next expected MsgSeqNum (EndSeqNo=0).
-    fn send_resend_request(&mut self, now: UtcMillis) {
+    fn send_resend_request(&mut self, now: SessionTime) {
         let begin = self.seq.next_target;
         self.send(now, msg_type::RESEND_REQUEST, |body| {
             body.field_u64(tag::BEGIN_SEQ_NO, begin)
                 .field_u64(tag::END_SEQ_NO, 0);
         });
-        self.resend_sent = now;
+        self.resend_sent = now.elapsed_ms;
     }
 
     fn advance_target(&mut self, next: u64) {
@@ -766,7 +825,7 @@ impl Session {
 
     fn reject(
         &mut self,
-        now: UtcMillis,
+        now: SessionTime,
         ref_seq: u64,
         ref_msg_type: &[u8],
         reason: u64,
@@ -782,13 +841,13 @@ impl Session {
     }
 
     /// Sends Logout with `text` and asks the host to disconnect.
-    fn fatal_logout(&mut self, now: UtcMillis, text: &[u8], reason: DisconnectReason) {
+    fn fatal_logout(&mut self, now: SessionTime, text: &[u8], reason: DisconnectReason) {
         if self.send_logout(now, text) {
             self.request_disconnect(reason, now);
         }
     }
 
-    fn send_logout(&mut self, now: UtcMillis, text: &[u8]) -> bool {
+    fn send_logout(&mut self, now: SessionTime, text: &[u8]) -> bool {
         self.send(now, msg_type::LOGOUT, |body| {
             if !text.is_empty() {
                 body.field(tag::TEXT, text);
@@ -796,7 +855,7 @@ impl Session {
         })
     }
 
-    fn send_logon(&mut self, now: UtcMillis, reset: bool) -> bool {
+    fn send_logon(&mut self, now: SessionTime, reset: bool) -> bool {
         let heartbeat_s = self.heartbeat_ms / 1000;
         let credentials = if self.config.has_logon_credentials() {
             (self.config.username.clone(), self.config.password.clone())
@@ -818,14 +877,14 @@ impl Session {
         })
     }
 
-    fn request_disconnect(&mut self, reason: DisconnectReason, now: UtcMillis) {
+    fn request_disconnect(&mut self, reason: DisconnectReason, now: SessionTime) {
         self.enter(State::Disconnecting, now);
         self.push_event(Event::DisconnectRequested(reason));
     }
 
-    fn enter(&mut self, state: State, now: UtcMillis) {
+    fn enter(&mut self, state: State, now: SessionTime) {
         self.state = state;
-        self.state_since = now;
+        self.state_since = now.elapsed_ms;
     }
 
     /// Queues an event. When the host has not taken the events and the queue
@@ -846,7 +905,7 @@ impl Session {
     /// not take the output, the session disconnects instead of growing it.
     /// Returns false when the message was not written; then the session has
     /// asked the host to disconnect.
-    fn send(&mut self, now: UtcMillis, kind: &[u8], fill: impl FnOnce(&mut Body)) -> bool {
+    fn send(&mut self, now: SessionTime, kind: &[u8], fill: impl FnOnce(&mut Body)) -> bool {
         let seq = self.seq.next_sender;
         match self.write_message(now, kind, seq, fill) {
             Ok(()) => {
@@ -860,7 +919,7 @@ impl Session {
         }
     }
 
-    fn disconnect_after(&mut self, error: SendError, now: UtcMillis) {
+    fn disconnect_after(&mut self, error: SendError, now: SessionTime) {
         let reason = match error {
             SendError::TooLarge => DisconnectReason::MessageTooLarge,
             SendError::OutputFull | SendError::NotActive => DisconnectReason::OutputFull,
@@ -874,7 +933,7 @@ impl Session {
     /// the sender sequence. On an error nothing is written.
     fn write_message(
         &mut self,
-        now: UtcMillis,
+        now: SessionTime,
         kind: &[u8],
         seq: u64,
         fill: impl FnOnce(&mut Body),
@@ -883,7 +942,7 @@ impl Session {
             return Err(SendError::OutputFull);
         }
         let mut time = [0u8; 21];
-        let sending_time = write_utc_timestamp(now, &mut time);
+        let sending_time = write_utc_timestamp(now.utc, &mut time);
         let mut body = self.encoder.start(kind);
         body.field(tag::SENDER_COMP_ID, &self.config.sender_comp_id)
             .field(tag::TARGET_COMP_ID, &self.config.target_comp_id)
@@ -894,7 +953,7 @@ impl Session {
             .finish(&self.config.begin_string)
             .map_err(|_| SendError::TooLarge)?;
         self.output.extend_from_slice(bytes);
-        self.last_sent = now;
+        self.last_sent = now.elapsed_ms;
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ publish = false
 [lints]
 workspace = true
 
-[dev-dependencies]
+[dependencies]
 eframe = { version = "0.37.0", default-features = false, features = [
   "accesskit",
   "clipboard",
@@ -17,3 +17,14 @@ eframe = { version = "0.37.0", default-features = false, features = [
   "wayland",
   "x11",
 ] }
+fix-codec = { path = "../fix-codec" }
+fix-dict = { path = "../fix-dict" }
+fix-session = { path = "../fix-session" }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+thiserror = "2"
+
+tempfile = "3"
+
+[[bin]]
+name = "fixtester"
+path = "src/main.rs"

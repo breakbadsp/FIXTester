@@ -14,6 +14,6 @@ mod time;
 
 pub use decode::{DecodeError, Decoder, Field, Fields, Message, parse_bool, parse_u64};
 pub use encode::{Body, Encoder, TooLarge};
-pub use frame::{FrameError, SOH, frame, skip_garbled};
+pub use frame::{FrameError, Framed, SOH, frame, frame_with_checksum, skip_garbled};
 pub use group::{Group, GroupDef, GroupEntries, GroupError, Member};
 pub use time::{UtcMillis, parse_utc_timestamp, write_utc_timestamp};
