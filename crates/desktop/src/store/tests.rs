@@ -528,3 +528,15 @@ fn wal_crossing_threshold_before_write_lock_retries_after_checkpoint() {
     assert_eq!(holder.profiles().unwrap()[0].id, saved);
     assert!(holder.wal_len().unwrap() < limits.wal_pressure);
 }
+
+#[test]
+fn dropping_one_batch_keeps_the_reused_id_pinned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("pins.db")).unwrap();
+    let failed = store.protect(vec![7]);
+    let active = store.protect(vec![7]);
+    drop(failed);
+    assert_eq!(store.pinned_ids(), "[7]");
+    drop(active);
+    assert_eq!(store.pinned_ids(), "[]");
+}

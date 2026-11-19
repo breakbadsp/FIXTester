@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,13 +42,13 @@ pub struct Store {
     database: PathBuf,
     wal: PathBuf,
     limits: HistoryLimits,
-    pins: Arc<Mutex<BTreeSet<i64>>>,
+    pins: Arc<Mutex<BTreeMap<i64, usize>>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PendingWrites {
     ids: Vec<i64>,
-    pins: Arc<Mutex<BTreeSet<i64>>>,
+    pins: Arc<Mutex<BTreeMap<i64, usize>>>,
 }
 
 impl PendingWrites {
@@ -65,7 +65,13 @@ impl Drop for PendingWrites {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for id in &self.ids {
-                pins.remove(id);
+                if let std::collections::btree_map::Entry::Occupied(mut pin) = pins.entry(*id) {
+                    if *pin.get() == 1 {
+                        pin.remove();
+                    } else {
+                        *pin.get_mut() -= 1;
+                    }
+                }
             }
         }
     }
@@ -144,7 +150,7 @@ impl Store {
     fn connect(
         path: &Path,
         limits: HistoryLimits,
-        pins: Arc<Mutex<BTreeSet<i64>>>,
+        pins: Arc<Mutex<BTreeMap<i64, usize>>>,
     ) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
@@ -165,18 +171,9 @@ impl Store {
         }
 
         connection.pragma_update(None, "max_page_count", limits.max_pages)?;
-        let filename = connection
-            .path()
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                database_fault(
-                    ffi::SQLITE_IOERR,
-                    "SQLite did not report a usable database filename.",
-                )
-            })?;
-        let database = PathBuf::from(filename);
-        let mut wal = String::from(filename);
-        wal.push_str("-wal");
+        let database = std::fs::canonicalize(path)?;
+        let mut wal = database.as_os_str().to_os_string();
+        wal.push("-wal");
         let store = Self {
             connection,
             database,
@@ -269,16 +266,19 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         format!(
             "[{}]",
-            ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ids.keys().map(i64::to_string).collect::<Vec<_>>().join(",")
         )
     }
 
     fn protect(&self, ids: Vec<i64>) -> PendingWrites {
         if !ids.is_empty() {
-            self.pins
+            let mut pins = self
+                .pins
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(ids.iter().copied());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in &ids {
+                *pins.entry(*id).or_default() += 1;
+            }
         }
         PendingWrites {
             ids,

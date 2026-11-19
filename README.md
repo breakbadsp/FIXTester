@@ -114,7 +114,8 @@ time. Its temporary output file is also at most 256 MiB.
 
 Storage is in `$XDG_DATA_HOME/fixtester` or
 `$HOME/.local/share/fixtester`. Use `--data-dir PATH` for a separate
-database. One instance can use each data directory at a time.
+database. One instance can use each database at a time. Symlinks share
+the database lock. The database file must have a single hard link.
 
 History is searchable for seven days. Maintenance removes expired rows
 in batches and trims the oldest captured rows toward the 128 MiB soft
