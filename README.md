@@ -61,8 +61,9 @@ and order fields. Replace carries valid standard instructions that the
 replacement supports. Expand **Carried FIX fields** to inspect them.
 For a price change, edit the limit price and send.
 Select the sent replacement before opening Cancel to use its ClOrdID.
-For a manual reference, open Replace or Cancel and enter OrigClOrdID and
-the order fields. FIXTester generates each new ClOrdID.
+OrigClOrdID is read-only when the form comes from a sent order.
+Select **Enter original details manually** to clear the copied fields and
+start a blank draft. Enter OrigClOrdID and the order fields. FIXTester generates each new ClOrdID.
 
 The tag editor accepts an application MsgType, such as `8` for an
 Execution Report, and one `Tag=Value` per line. It accepts custom tags
@@ -100,18 +101,44 @@ The timeline searches the selected profile for tags, values, summaries,
 or transfer status. Filter by direction or show application messages
 only. Use **Raw** to display exact bytes with `\xNN` escapes. **Export…**
 writes matching captured bytes from one database snapshot in timeline
-order to a new file and keeps the SOH bytes. It includes any captured fragment. A partial write
-exports only the prefix that TCP accepted. An unconfirmed send keeps the
-planned frame for inspection. TCP write success does not prove peer receipt.
+order to a new file and keeps the SOH bytes. It includes any captured
+fragment. A partial write exports only the prefix that TCP accepted.
+An unconfirmed send keeps the planned frame for inspection. TCP write
+success does not prove peer receipt. Export captures at most 256 MiB of
+bytes in 1 MiB memory chunks. FIXTester releases the SQLite read
+snapshot before it writes to the destination. One export runs at a
+time. Its temporary output file is also at most 256 MiB.
 
 Storage is in `$XDG_DATA_HOME/fixtester` or
 `$HOME/.local/share/fixtester`. Use `--data-dir PATH` for a separate
-database. One instance can use each data directory at a time. The
-database retains seven days of history, 128 profiles, and the last
-values for up to 256 symbols per profile. The database limit is 512 MiB
-with the default page size. If SQLite cannot save a session transition,
-FIXTester stops that session. The frame limit is 16 KiB and the decoder
-limit is 256 fields per message.
+database. One instance can use each data directory at a time.
+
+History is searchable for seven days. Maintenance removes expired rows
+in batches and trims the oldest captured rows toward the 128 MiB soft
+target. Before a session transition can commit, FIXTester trims older
+rows as needed to stay at or below the 256 MiB hard cap. The charge per
+row is the raw payload length, the byte lengths of MsgType, sequence
+text, and summary, at least 16 bytes for status, and 128 bytes for the
+six integer columns and a fixed metadata allowance. This charge is
+independent of SQLite page allocation. On first open, FIXTester charges
+existing rows and trims an over-limit database. Trimming keeps the
+profiles, sequence checkpoints, and remembered order values.
+
+SQLite limits the main database to 131,072 pages of 4096 bytes
+(512 MiB). Deleted pages can be reused. Deletion does not shrink the
+main file. The page limit includes all tables and indexes. It excludes
+the WAL, the shared-memory index, and export files. SQLite attempts an
+automatic checkpoint after 128 WAL pages and aims to leave at most
+4 MiB of recycled WAL space. If the WAL reaches 16 MiB, FIXTester tries
+a truncate checkpoint before the next write. It checks again under the
+SQLite write lock and returns a storage error if the WAL is still at
+the threshold. One bounded transaction can take the WAL past that
+threshold. Export destination writes hold no database read snapshot.
+
+The database supports 128 profiles and remembers up to 256 symbols per
+profile. If SQLite cannot save a session transition, FIXTester stops
+that session. The frame limit is 16 KiB and the decoder limit is 256
+fields per message.
 
 ## Build and verify
 
@@ -134,7 +161,9 @@ versions, eight simultaneous sessions, restart, reset, gaps, and
 heartbeat recovery. The egui test drives keyboard and accessibility
 events in the real workspace code and checks the New, report, Replace,
 and Cancel workflow over TCP. The write failure test checks the saved
-sequence and the exported byte prefix.
+sequence and the exported byte prefix. Storage tests cover quota
+boundaries, migration, concurrent writes, and a purge and WAL truncate
+checkpoint during a blocked export write.
 
 The AlmaLinux command builds the release on AlmaLinux 8, runs the
 desktop crate tests there, checks the glibc ceiling of 2.28, and runs the

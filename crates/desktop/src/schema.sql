@@ -1,10 +1,3 @@
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=FULL;
-PRAGMA foreign_keys=ON;
-PRAGMA max_page_count=131072;
-PRAGMA wal_autocheckpoint=128;
-PRAGMA journal_size_limit=4194304;
-
 CREATE TABLE IF NOT EXISTS profile (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,

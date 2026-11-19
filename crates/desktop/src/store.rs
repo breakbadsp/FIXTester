@@ -1,11 +1,11 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fix_codec::{Decoder, UtcMillis, tag};
 use fix_dict::Version;
 use fix_session::{Role, SequenceNumbers};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, ffi, params};
 
 use crate::model::{FIELDS_MAX, OrderValues, Profile, now};
 use crate::{Result, invalid};
@@ -14,9 +14,29 @@ const RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const PAGE_ROWS: u32 = 200;
 const PROFILES_MAX: i64 = 128;
 const SCHEMA: &str = include_str!("schema.sql");
+const QUOTA_SCHEMA: &str = include_str!("store/history-quota.sql");
+const TRIM_ROWS: usize = 256;
+const MIB: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct HistoryLimits {
+    soft: usize,
+    hard: usize,
+    wal_pressure: u64,
+}
+
+const LIMITS: HistoryLimits = HistoryLimits {
+    soft: 128 * MIB,
+    hard: 256 * MIB,
+    wal_pressure: 16 * MIB as u64,
+};
 
 #[derive(Debug)]
-pub struct Store(Connection);
+pub struct Store {
+    connection: Connection,
+    wal: PathBuf,
+    limits: HistoryLimits,
+}
 
 #[derive(Debug, Clone)]
 pub struct SavedProfile {
@@ -73,14 +93,87 @@ pub(crate) struct Transition<'a> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_limits(path, LIMITS)
+    }
+
+    fn open_with_limits(path: &Path, limits: HistoryLimits) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
-        connection.execute_batch(SCHEMA)?;
-        Ok(Self(connection))
+        connection.execute_batch(
+            "PRAGMA page_size=4096;
+             PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA max_page_count=131072;
+             PRAGMA wal_autocheckpoint=128;
+             PRAGMA journal_size_limit=4194304;
+             PRAGMA cache_spill=OFF;",
+        )?;
+        let page_size: u32 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        if page_size != 4096 {
+            return Err(invalid(
+                "The FIXTester database requires 4096-byte SQLite pages.",
+            ));
+        }
+
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let store = Self {
+            connection,
+            wal: PathBuf::from(wal),
+            limits,
+        };
+        store.migrate()?;
+        if history_bytes(&store.connection)? > limits.hard {
+            store.trim_to(limits.soft)?;
+        }
+        Ok(store)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let version = |conn: &Connection| {
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        };
+        match version(&self.connection)? {
+            0 => {
+                let tx = self.write_transaction()?;
+                if version(&tx)? == 0 {
+                    tx.execute_batch(SCHEMA)?;
+                    tx.execute_batch(QUOTA_SCHEMA)?;
+                }
+                tx.commit()?;
+            }
+            1 => {}
+            _ => return Err(invalid("This FIXTester database uses a newer schema.")),
+        }
+        Ok(())
+    }
+
+    fn wal_len(&self) -> Result<u64> {
+        match std::fs::metadata(&self.wal) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write_transaction(&self) -> Result<Transaction<'_>> {
+        if self.wal_len()? >= self.limits.wal_pressure {
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        }
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        // Check under SQLite's write lock so other connections cannot race the gate.
+        if self.wal_len()? >= self.limits.wal_pressure {
+            return Err(storage_pressure(
+                "The SQLite WAL is pinned by a reader. Retry after it closes.",
+            ));
+        }
+        Ok(tx)
     }
 
     pub fn profiles(&self) -> Result<Vec<SavedProfile>> {
-        let mut query = self.0.prepare(
+        let mut query = self.connection.prepare(
             "SELECT id,name,version,sender,target,role,address,heartbeat FROM profile ORDER BY name,id",
         )?;
         let rows = query.query_map([], read_profile)?;
@@ -89,9 +182,7 @@ impl Store {
 
     pub fn save_profile(&mut self, id: Option<i64>, profile: &Profile) -> Result<i64> {
         profile.validate()?;
-        let tx = self
-            .0
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.write_transaction()?;
         let role = i64::from(profile.role == Role::Acceptor);
         let address = profile.address.to_string();
         if let Some(id) = id {
@@ -145,7 +236,7 @@ impl Store {
     }
 
     pub fn checkpoint(&self, id: i64) -> Result<Checkpoint> {
-        Ok(self.0.query_row(
+        Ok(self.connection.query_row(
             "SELECT next_send,next_receive,reset FROM profile WHERE id=?1",
             [id],
             |row| {
@@ -161,19 +252,21 @@ impl Store {
     }
 
     pub(crate) fn arm_reset(&self, id: i64) -> Result<()> {
-        let updated = self.0.execute(
+        let tx = self.write_transaction()?;
+        let updated = tx.execute(
             "UPDATE profile SET next_send=1,next_receive=1,reset=1 WHERE id=?1",
             [id],
         )?;
         if updated != 1 {
             return Err(invalid("Select a saved profile."));
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn last_values(&self, id: i64, symbol: Option<&str>) -> Result<Option<OrderValues>> {
         Ok(self
-            .0
+            .connection
             .query_row(
                 "SELECT symbol,side,quantity,price FROM order_values WHERE profile=?1
              AND (?2 IS NULL OR symbol=?2) ORDER BY recent DESC LIMIT 1",
@@ -191,30 +284,51 @@ impl Store {
     }
 
     pub(crate) fn next_order_id(&self, time: UtcMillis) -> Result<String> {
-        let number: u64 = self.0.query_row(
+        let tx = self.write_transaction()?;
+        let number: u64 = tx.query_row(
             "UPDATE serial SET value=value+1 RETURNING value",
             [],
             |row| row.get(0),
         )?;
+        tx.commit()?;
         Ok(format!("FT-{}-{number}", time.0))
     }
 
-    pub(crate) fn commit(&mut self, id: i64, change: Transition<'_>) -> Result<Vec<i64>> {
-        let tx = self
-            .0
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    pub(crate) fn commit(&mut self, id: i64, change: &Transition<'_>) -> Result<Vec<i64>> {
+        for _ in 0..4 {
+            let tx = self.write_transaction()?;
+            let before = history_bytes(&tx)?;
+            let outgoing = Self::record(&tx, id, change)?;
+            let after = history_bytes(&tx)?;
+            let added = after - before;
+            let available = self.limits.hard.checked_sub(added).ok_or_else(|| {
+                storage_pressure("One FIX session transition exceeds the history hard cap.")
+            })?;
+            if trim_oldest(&tx, after, self.limits.hard)? {
+                tx.commit()?;
+                return Ok(outgoing);
+            }
+            tx.rollback()?;
+            self.trim_to(available)?;
+        }
+        Err(storage_pressure(
+            "Concurrent FIX traffic exhausted the history quota.",
+        ))
+    }
+
+    fn record(tx: &Transaction<'_>, id: i64, change: &Transition<'_>) -> Result<Vec<i64>> {
         let Checkpoint { seq, reset } = change.checkpoint;
         tx.execute(
             "UPDATE profile SET next_send=?1,next_receive=?2,reset=?3 WHERE id=?4",
             params![seq.next_sender, seq.next_target, reset, id],
         )?;
-        if let Some(packet) = change.received {
-            insert(&tx, id, change.time, &packet)?;
+        if let Some(packet) = &change.received {
+            insert(tx, id, change.time, packet)?;
         }
         let mut outgoing = Vec::with_capacity(change.outgoing.len());
         for raw in change.outgoing {
             outgoing.push(insert(
-                &tx,
+                tx,
                 id,
                 change.time,
                 &Packet {
@@ -229,36 +343,63 @@ impl Store {
                 .first()
                 .copied()
                 .ok_or_else(|| invalid("Order frame missing."))?;
-            remember(&tx, id, recent, values)?;
+            remember(tx, id, recent, values)?;
         }
-        tx.commit()?;
         Ok(outgoing)
     }
 
     pub(crate) fn finish_write(&self, id: i64, count: usize, complete: bool) -> Result<()> {
         let status = if complete { "Sent" } else { "Write failed" };
-        self.0.execute(
+        let tx = self.write_transaction()?;
+        tx.execute(
             "UPDATE history SET status=?1,transferred=?2 WHERE id=?3",
             params![status, count, id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn purge(&self) -> Result<()> {
-        self.purge_before(retention_cutoff())
+    /// Returns true when retention and size maintenance have caught up.
+    pub fn purge(&self) -> Result<bool> {
+        let age_done = self.purge_before(retention_cutoff())?;
+        let size_done = self.trim_batch(self.limits.soft)?;
+        Ok(age_done && size_done)
     }
 
-    fn purge_before(&self, cutoff: u64) -> Result<()> {
-        // Delete in batches so that other connections can commit between batches.
-        self.0.execute(
-            "DELETE FROM history WHERE id IN (SELECT id FROM history WHERE time_ms<?1 LIMIT 4096)",
-            [cutoff],
+    fn purge_before(&self, cutoff: u64) -> Result<bool> {
+        let tx = self.write_transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM history WHERE id IN (SELECT id FROM history
+             WHERE time_ms<?1 ORDER BY time_ms LIMIT ?2)",
+            params![cutoff, TRIM_ROWS],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(removed < TRIM_ROWS)
+    }
+
+    fn trim_to(&self, target: usize) -> Result<()> {
+        // Another writer can replenish history between batches. Bound the work in one call.
+        let excess = history_bytes(&self.connection)?.saturating_sub(target);
+        let batches = excess.div_ceil(144 * TRIM_ROWS) + 4;
+        for _ in 0..batches {
+            if self.trim_batch(target)? {
+                return Ok(());
+            }
+        }
+        Err(storage_pressure(
+            "History trim did not reach its target. Retry after traffic slows.",
+        ))
+    }
+
+    fn trim_batch(&self, target: usize) -> Result<bool> {
+        let tx = self.write_transaction()?;
+        let done = trim_oldest(&tx, history_bytes(&tx)?, target)?;
+        tx.commit()?;
+        Ok(done)
     }
 
     pub fn history(&self, id: i64, filter: &Filter, before: Option<i64>) -> Result<Vec<Entry>> {
-        let mut query = self.0.prepare(&format!(
+        let mut query = self.connection.prepare(&format!(
             "SELECT id,time_ms,direction,kind,seq,summary,status,transferred,raw {WHERE_HISTORY}
              AND (?6 IS NULL OR id<?6) ORDER BY id DESC LIMIT {PAGE_ROWS}",
         ))?;
@@ -289,47 +430,94 @@ impl Store {
     }
 
     fn write_export(&self, id: i64, filter: &Filter, file: &mut impl Write) -> Result<usize> {
-        let cutoff = retention_cutoff();
-        // Keep one read transaction so later pages see the same rows after retention runs.
-        let snapshot = self.0.unchecked_transaction()?;
-        let mut query = snapshot.prepare(&format!(
-            "SELECT id,substr(raw,1,transferred) {WHERE_HISTORY}
-             AND transferred>0 AND id>?6 ORDER BY id LIMIT {PAGE_ROWS}",
+        let (count, chunks) = self.capture_export(id, filter)?;
+        for chunk in &chunks {
+            file.write_all(chunk)?;
+        }
+        Ok(count)
+    }
+
+    fn capture_export(&self, id: i64, filter: &Filter) -> Result<(usize, Vec<Vec<u8>>)> {
+        // A single SELECT keeps one snapshot. Its cursor drops before destination writes.
+        let mut query = self.connection.prepare(&format!(
+            "SELECT raw,transferred {WHERE_HISTORY} AND transferred>0 ORDER BY id",
         ))?;
+        let mut rows = query.query(params![
+            id,
+            direction_param(filter),
+            filter.text,
+            filter.application_only,
+            retention_cutoff(),
+        ])?;
         let mut count = 0;
-        let mut after = 0;
-        loop {
-            let (next, bytes, length) = {
-                let mut rows = query.query(params![
-                    id,
-                    direction_param(filter),
-                    filter.text,
-                    filter.application_only,
-                    cutoff,
-                    after,
-                ])?;
-                let mut bytes = Vec::new();
-                let mut length = 0;
-                let mut next = after;
-                while let Some(row) = rows.next()? {
-                    next = row.get(0)?;
-                    bytes.extend_from_slice(
-                        row.get_ref(1)?
-                            .as_blob()
-                            .map_err(|err| invalid(err.to_string()))?,
-                    );
-                    length += 1;
+        let mut remaining = self.limits.hard;
+        let mut chunks = Vec::<Vec<u8>>::new();
+        let mut chunk_limit = 0;
+        while let Some(row) = rows.next()? {
+            let raw = row
+                .get_ref(0)?
+                .as_blob()
+                .map_err(|err| invalid(err.to_string()))?;
+            let mut prefix = raw
+                .get(..row.get::<_, usize>(1)?)
+                .ok_or_else(|| invalid("Invalid captured byte count."))?;
+            while !prefix.is_empty() {
+                if let Some(chunk) = chunks.last_mut() {
+                    let added = prefix.len().min(chunk_limit - chunk.len());
+                    chunk.extend_from_slice(&prefix[..added]);
+                    prefix = &prefix[added..];
+                    if prefix.is_empty() {
+                        break;
+                    }
                 }
-                (next, bytes, length)
-            };
-            file.write_all(&bytes)?;
-            count += length;
-            after = next;
-            if length < PAGE_ROWS as usize {
-                return Ok(count);
+                if remaining == 0 {
+                    return Err(storage_pressure("The export exceeds the history hard cap."));
+                }
+                chunk_limit = remaining.min(MIB);
+                let mut chunk = Vec::new();
+                chunk
+                    .try_reserve_exact(chunk_limit)
+                    .map_err(|err| invalid(format!("Cannot allocate export buffer: {err}")))?;
+                remaining -= chunk_limit;
+                chunks.push(chunk);
+            }
+            count += 1;
+        }
+        Ok((count, chunks))
+    }
+}
+
+fn trim_oldest(tx: &Transaction<'_>, mut bytes: usize, target: usize) -> Result<bool> {
+    if bytes <= target {
+        return Ok(true);
+    }
+    let last = {
+        let mut query = tx.prepare("SELECT id,charge FROM history ORDER BY id LIMIT ?1")?;
+        let mut rows = query.query([TRIM_ROWS])?;
+        let mut last = None;
+        while let Some(row) = rows.next()? {
+            last = Some(row.get::<_, i64>(0)?);
+            bytes -= row.get::<_, usize>(1)?;
+            if bytes <= target {
+                break;
             }
         }
-    }
+        last.ok_or_else(|| invalid("History quota does not match the stored rows."))?
+    };
+    tx.execute("DELETE FROM history WHERE id<=?1", [last])?;
+    Ok(bytes <= target)
+}
+
+fn storage_pressure(message: &str) -> crate::Error {
+    rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_FULL), Some(message.into())).into()
+}
+
+fn history_bytes(connection: &Connection) -> Result<usize> {
+    Ok(
+        connection.query_row("SELECT bytes FROM history_quota WHERE id=1", [], |row| {
+            row.get(0)
+        })?,
+    )
 }
 
 const WHERE_HISTORY: &str = "FROM history WHERE profile=?1 AND (?2 IS NULL OR direction=?2)
@@ -443,99 +631,4 @@ pub fn escape(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-
-    use super::*;
-
-    struct PurgeBetweenPages<'a> {
-        store: &'a Store,
-        profile: i64,
-        cutoff: u64,
-        output: Vec<u8>,
-    }
-
-    impl Write for PurgeBetweenPages<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.output.extend_from_slice(bytes);
-            if self.output.len() == bytes.len() {
-                self.store
-                    .purge_before(self.cutoff)
-                    .map_err(std::io::Error::other)?;
-                assert!(
-                    self.store
-                        .history(self.profile, &Filter::default(), None)
-                        .unwrap()
-                        .is_empty()
-                );
-            }
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn export_keeps_its_initial_matches_when_retention_runs_between_pages() {
-        let dir = tempfile::tempdir().unwrap();
-        let database = dir.path().join("test.db");
-        let mut exporter = Store::open(&database).unwrap();
-        let purger = Store::open(&database).unwrap();
-        let id = exporter
-            .save_profile(
-                None,
-                &Profile {
-                    name: "Export".into(),
-                    version: Version::Fix44,
-                    sender: "TEST".into(),
-                    target: "PEER".into(),
-                    role: Role::Initiator,
-                    address: "127.0.0.1:9876".parse().unwrap(),
-                    heartbeat: 30,
-                },
-            )
-            .unwrap();
-        let time = now();
-        let mut expected = Vec::new();
-        let rows = (PAGE_ROWS * 2 + 1) as usize;
-        for i in 0..rows {
-            let raw = format!("Captured bytes {i}\x01");
-            exporter
-                .commit(
-                    id,
-                    Transition {
-                        time,
-                        checkpoint: exporter.checkpoint(id).unwrap(),
-                        received: Some(Packet {
-                            raw: raw.as_bytes(),
-                            direction: Direction::Received,
-                            status: "Incomplete frame",
-                        }),
-                        outgoing: &[],
-                        values: None,
-                    },
-                )
-                .unwrap();
-            expected.extend_from_slice(raw.as_bytes());
-        }
-        let mut sink = PurgeBetweenPages {
-            store: &purger,
-            profile: id,
-            cutoff: time.0 + 1,
-            output: Vec::new(),
-        };
-        let count = exporter
-            .write_export(id, &Filter::default(), &mut sink)
-            .unwrap();
-        assert_eq!(count, rows);
-        assert_eq!(sink.output, expected);
-        assert!(
-            exporter
-                .history(id, &Filter::default(), None)
-                .unwrap()
-                .is_empty()
-        );
-    }
-}
+mod tests;

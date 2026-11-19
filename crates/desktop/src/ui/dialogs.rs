@@ -68,6 +68,7 @@ pub(super) struct OrderDraft {
     id: i64,
     order: Order,
     recalled_symbol: String,
+    selected_reference: bool,
     focus: bool,
     waiting: Option<u64>,
 }
@@ -85,6 +86,7 @@ impl Workspace {
         let Some(id) = self.selected else { return };
         self.notice.clear();
         let mut order = Order::new(kind, OrderValues::default(), String::new());
+        let mut selected_reference = false;
         if kind == OrderKind::New {
             match self.store.last_values(id, None) {
                 Ok(Some(values)) => order.values = values,
@@ -93,7 +95,10 @@ impl Workspace {
             }
         } else if from_row {
             match self.order_from_row(kind) {
-                Ok(Some(selected)) => order = selected,
+                Ok(Some(selected)) => {
+                    order = selected;
+                    selected_reference = true;
+                }
                 Ok(None) => {}
                 Err(error) => self.notice = error.to_string(),
             }
@@ -101,6 +106,7 @@ impl Workspace {
         self.dialog = Some(Dialog::Order(OrderDraft {
             id,
             recalled_symbol: order.values.symbol.clone(),
+            selected_reference,
             order,
             focus: true,
             waiting: None,
@@ -218,8 +224,9 @@ impl Workspace {
         });
         ui.add_space(6.0);
         self.order_fields(ui, draft);
-        if kind != OrderKind::New && ui.link("Enter original details manually").clicked() {
+        if draft.selected_reference && ui.link("Enter original details manually").clicked() {
             draft.order = Order::new(kind, OrderValues::default(), String::new());
+            draft.selected_reference = false;
             self.notice.clear();
         }
         if !draft.order.carried().is_empty() {
@@ -259,7 +266,11 @@ impl Workspace {
             .num_columns(2)
             .spacing([18.0, 8.0])
             .show(ui, |ui| {
-                if kind != OrderKind::New {
+                if draft.selected_reference {
+                    ui.label("OrigClOrdID (read-only)");
+                    ui.monospace(&draft.order.original);
+                    ui.end_row();
+                } else if kind != OrderKind::New {
                     field(ui, "OrigClOrdID", &mut draft.order.original, 128);
                 }
                 let symbol = field(ui, "Symbol", &mut values.symbol, 64);

@@ -63,7 +63,7 @@ pub struct Workspace {
     search_focus: bool,
     dialog: Option<Dialog>,
     notice: String,
-    purge_time: Instant,
+    next_purge: Instant,
     smoke: Option<Arc<AtomicBool>>,
     exporting: Option<Receiver<Result<usize>>>,
     close_started: Option<Instant>,
@@ -72,7 +72,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn open(path: &Path, smoke: Option<Arc<AtomicBool>>) -> Result<Self> {
         let store = Store::open(path)?;
-        store.purge()?;
+        let purged = store.purge()?;
         let profiles = store.profiles()?;
         let selected = profiles.first().map(|profile| profile.id);
         Ok(Self {
@@ -91,7 +91,7 @@ impl Workspace {
             search_focus: false,
             dialog: None,
             notice: String::new(),
-            purge_time: Instant::now(),
+            next_purge: Instant::now() + purge_interval(purged),
             smoke,
             exporting: None,
             close_started: None,
@@ -163,12 +163,18 @@ impl Workspace {
     }
 
     fn poll(&mut self) {
-        if self.purge_time.elapsed() >= Duration::from_secs(30) {
-            self.purge_time = Instant::now();
-            match self.store.purge() {
-                Ok(()) => self.refresh = true,
-                Err(error) => self.notice = error.to_string(),
-            }
+        if Instant::now() >= self.next_purge {
+            let done = match self.store.purge() {
+                Ok(done) => {
+                    self.refresh = true;
+                    done
+                }
+                Err(error) => {
+                    self.notice = error.to_string();
+                    true
+                }
+            };
+            self.next_purge = Instant::now() + purge_interval(done);
         }
         if let Some(rx) = &self.exporting {
             match rx.try_recv() {
@@ -468,3 +474,11 @@ impl eframe::App for Workspace {
 
 #[cfg(test)]
 mod verification;
+
+fn purge_interval(done: bool) -> Duration {
+    if done {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_millis(125)
+    }
+}

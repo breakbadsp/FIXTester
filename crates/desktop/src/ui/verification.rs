@@ -126,6 +126,36 @@ impl Driver {
         self.replace_text(text);
     }
 
+    fn wait_for_workspace(&mut self) {
+        let since = Instant::now();
+        loop {
+            self.frame(Vec::new(), Modifiers::NONE);
+            if self
+                .context
+                .memory(|memory| memory.top_modal_layer().is_none())
+            {
+                return;
+            }
+            assert!(
+                since.elapsed() < Duration::from_secs(4),
+                "The dialog did not close."
+            );
+            thread::sleep(Duration::from_millis(16));
+        }
+    }
+
+    fn assert_selected_reference(&mut self, reference: &[u8]) {
+        self.wait_for(accesskit::Role::Label, "OrigClOrdID (read-only)");
+        self.wait_for(
+            accesskit::Role::Label,
+            std::str::from_utf8(reference).unwrap(),
+        );
+        assert!(
+            self.find(accesskit::Role::TextInput, "OrigClOrdID")
+                .is_none()
+        );
+    }
+
     fn replace_text(&mut self, text: &str) {
         self.key(Key::A, Modifiers::COMMAND);
         self.frame(vec![Event::Text(text.into())], Modifiers::NONE);
@@ -161,6 +191,7 @@ fn order_flow(from_tags: bool) {
     ui.enter("TargetCompID", &profile.target);
     ui.enter("Peer address", &profile.address.to_string());
     ui.click("Save profile");
+    ui.wait_for_workspace();
     ui.key(Key::F5, Modifiers::NONE);
     addr.set_nonblocking(true).unwrap();
     let start = Instant::now();
@@ -201,6 +232,7 @@ fn order_flow(from_tags: bool) {
     }
     ui.click("Send");
     let raw = peer.receive(b"D", 2);
+    ui.wait_for_workspace();
     let mut decoder = Decoder::new(256);
     let fields = decoder.decode(&raw).unwrap().fields();
     let original = fields.get(11).unwrap().to_vec();
@@ -228,9 +260,11 @@ fn order_flow(from_tags: bool) {
 
     ui.click("NewOrderSingle");
     ui.key(Key::R, Modifiers::CTRL);
+    ui.assert_selected_reference(&original);
     ui.enter("Limit price", "19.75");
     ui.click("Send");
     let raw = peer.receive(b"G", 3);
+    ui.wait_for_workspace();
     let fields = decoder.decode(&raw).unwrap().fields();
     assert_eq!(fields.get(41), Some(original.as_slice()));
     assert_eq!(fields.get(38), Some(&b"40"[..]));
@@ -255,10 +289,46 @@ fn order_flow(from_tags: bool) {
 
     ui.click("OrderCancelReplaceRequest");
     ui.key(Key::K, Modifiers::CTRL);
+    ui.assert_selected_reference(&replace);
     ui.click("Send");
     let raw = peer.receive(b"F", 4);
+    ui.wait_for_workspace();
     assert_eq!(
         decoder.decode(&raw).unwrap().fields().get(41),
         Some(replace.as_slice())
     );
+    if from_tags {
+        manual_replace(&mut ui, &mut peer, &replace);
+    }
+}
+
+fn manual_replace(ui: &mut Driver, peer: &mut Wire, previous: &[u8]) {
+    ui.click("OrderCancelReplaceRequest");
+    ui.key(Key::R, Modifiers::CTRL);
+    ui.assert_selected_reference(previous);
+    let manual = ui.wait_for(accesskit::Role::Link, "Enter original details manually");
+    ui.action(manual, accesskit::Action::Click);
+    for label in ["OrigClOrdID", "Symbol", "Quantity", "Limit price"] {
+        let id = ui.wait_for(accesskit::Role::TextInput, label);
+        let input = ui.nodes.iter().find(|(node, _)| *node == id).unwrap();
+        assert_eq!(input.1.value().unwrap_or_default(), "");
+    }
+    assert!(
+        ui.find(accesskit::Role::Label, "OrigClOrdID (read-only)")
+            .is_none()
+    );
+    ui.enter("OrigClOrdID", "MANUAL-ORDER");
+    ui.enter("Symbol", "MANUAL");
+    ui.enter("Quantity", "7");
+    ui.enter("Limit price", "6.20");
+    ui.click("Send");
+
+    let raw = peer.receive(b"G", 5);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    assert_eq!(fields.get(41), Some(&b"MANUAL-ORDER"[..]));
+    assert_eq!(fields.get(55), Some(&b"MANUAL"[..]));
+    for carried in [18, 22, 48, 59, 453] {
+        assert_eq!(fields.get(carried), None);
+    }
 }

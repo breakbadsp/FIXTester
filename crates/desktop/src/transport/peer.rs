@@ -273,7 +273,7 @@ impl Peer<'_> {
         if had_io {
             let ids = self.store.commit(
                 self.saved.id,
-                Transition {
+                &Transition {
                     time,
                     checkpoint: Checkpoint {
                         seq,
@@ -447,7 +447,7 @@ mod tests {
         let rows = store
             .commit(
                 id,
-                Transition {
+                &Transition {
                     time: now(),
                     checkpoint: Checkpoint {
                         seq: SequenceNumbers {
