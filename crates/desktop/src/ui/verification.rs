@@ -134,6 +134,15 @@ impl Driver {
 
 #[test]
 fn workspace_new_report_replace_and_cancel() {
+    order_flow(false);
+}
+
+#[test]
+fn workspace_price_only_replace_keeps_selected_instructions() {
+    order_flow(true);
+}
+
+fn order_flow(from_tags: bool) {
     let dir = tempfile::tempdir().unwrap();
     let addr = TcpListener::bind("127.0.0.1:0").unwrap();
     let profile = Profile {
@@ -173,10 +182,23 @@ fn workspace_new_report_replace_and_cancel() {
     peer.logon(1, false);
     ui.wait_for(accesskit::Role::Label, "Logon complete.");
 
-    ui.key(Key::N, Modifiers::CTRL);
-    ui.enter("Symbol", "WIDGET");
-    ui.enter("Quantity", "40");
-    ui.enter("Limit price", "19.50");
+    if from_tags {
+        ui.key(Key::T, Modifiers::CTRL);
+        ui.enter("MsgType", "D");
+        let editor = ui.wait_for(
+            accesskit::Role::MultilineTextInput,
+            "One Tag=Value pair per line.",
+        );
+        ui.action(editor, accesskit::Action::Focus);
+        ui.frame(vec![Event::Paste(
+            "11=TAG-ORDER\n55=WIDGET\n54=1\n38=40\n40=2\n44=19.50\n18=6\n59=1\n22=8\n48=SEC-DEMO\n60=20260101-00:00:00.000\n453=1\n448=DEMO-PARTY\n447=D\n452=1".into(),
+        )], Modifiers::NONE);
+    } else {
+        ui.key(Key::N, Modifiers::CTRL);
+        ui.enter("Symbol", "WIDGET");
+        ui.enter("Quantity", "40");
+        ui.enter("Limit price", "19.50");
+    }
     ui.click("Send");
     let raw = peer.receive(b"D", 2);
     let mut decoder = Decoder::new(256);
@@ -213,6 +235,22 @@ fn workspace_new_report_replace_and_cancel() {
     assert_eq!(fields.get(41), Some(original.as_slice()));
     assert_eq!(fields.get(38), Some(&b"40"[..]));
     assert_eq!(fields.get(44), Some(&b"19.75"[..]));
+    if from_tags {
+        assert_eq!(fields.get(18), Some(&b"6"[..]));
+        assert_eq!(fields.get(59), Some(&b"1"[..]));
+        assert_eq!(fields.get(48), Some(&b"SEC-DEMO"[..]));
+        assert_eq!(fields.get(22), Some(&b"8"[..]));
+        let parties = Version::Fix44.dictionary().group("G", 453).unwrap();
+        let group = fields.group(parties).unwrap().unwrap();
+        assert_eq!(
+            group.entries().next().unwrap().get(448),
+            Some(&b"DEMO-PARTY"[..])
+        );
+        assert_ne!(fields.get(60), Some(&b"20260101-00:00:00.000"[..]));
+        for header in [35, 34, 49, 52, 56] {
+            assert_eq!(fields.iter().filter(|(tag, _)| *tag == header).count(), 1);
+        }
+    }
     let replace = fields.get(11).unwrap().to_vec();
 
     ui.click("OrderCancelReplaceRequest");

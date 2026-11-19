@@ -29,6 +29,21 @@ pub enum FrameError {
 /// Returns `Ok(Some(len))` with the length of the message, or `Ok(None)` when
 /// `buf` holds only part of a message. After an error, call [`skip_garbled`].
 pub fn frame(buf: &[u8], len_max: usize) -> Result<Option<usize>, FrameError> {
+    frame_with_checksum(buf, len_max)?
+        .map(|frame| frame.checksum.map(|()| frame.len))
+        .transpose()
+}
+
+/// A frame with a known boundary and a separate checksum result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framed {
+    pub len: usize,
+    pub checksum: Result<(), FrameError>,
+}
+
+/// Finds a frame bounded by BodyLength and the checksum trailer. A checksum
+/// error preserves the boundary. An error outside the frame has no boundary.
+pub fn frame_with_checksum(buf: &[u8], len_max: usize) -> Result<Option<Framed>, FrameError> {
     let Some(begin_end) = field_end(buf, 0, BEGIN_STRING_LEN_MAX + 3)? else {
         return Ok(None);
     };
@@ -57,18 +72,23 @@ pub fn frame(buf: &[u8], len_max: usize) -> Result<Option<usize>, FrameError> {
         return Ok(None);
     }
     let trailer = &buf[trailer_start..total];
-    if !trailer.starts_with(b"10=") || trailer[TRAILER_LEN - 1] != SOH {
+    if buf[trailer_start - 1] != SOH
+        || !trailer.starts_with(b"10=")
+        || trailer[TRAILER_LEN - 1] != SOH
+    {
         return Err(FrameError::BadTrailer);
     }
-    let declared = crate::parse_u64(&trailer[3..6])
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or(FrameError::BadTrailer)?;
     let computed = checksum(&buf[..trailer_start]);
-    if declared != computed {
-        return Err(FrameError::ChecksumMismatch { declared, computed });
-    }
-    debug_assert!(total <= buf.len());
-    Ok(Some(total))
+    let checksum = match crate::parse_u64(&trailer[3..6]).and_then(|value| u8::try_from(value).ok())
+    {
+        Some(declared) if declared == computed => Ok(()),
+        Some(declared) => Err(FrameError::ChecksumMismatch { declared, computed }),
+        None => Err(FrameError::BadTrailer),
+    };
+    Ok(Some(Framed {
+        len: total,
+        checksum,
+    }))
 }
 
 /// Returns the number of bytes to drop after a [`FrameError`]: up to the next

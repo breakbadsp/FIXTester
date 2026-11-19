@@ -7,6 +7,10 @@
 //! sets [`Session::disconnect_requested`]; the host sends the output, closes
 //! the connection, and calls [`Session::on_disconnected`].
 //!
+//! Hosts with separate clocks use the `*_at` methods with [`SessionTime`]
+//! and schedule timers with [`Session::next_deadline_ms`]. The methods
+//! that take UTC alone use the same value for both clocks.
+//!
 //! When the peer asks for a resend, the session sends a gap fill for the whole
 //! range (requirement R17). It never sends old messages again.
 
@@ -15,5 +19,5 @@ mod session;
 
 pub use config::{Config, Role};
 pub use session::{
-    DisconnectReason, Disposition, Event, SendError, SequenceNumbers, Session, State,
+    DisconnectReason, Disposition, Event, SendError, SequenceNumbers, Session, SessionTime, State,
 };

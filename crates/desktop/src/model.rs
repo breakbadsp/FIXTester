@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fix_codec::{UtcMillis, tag, write_utc_timestamp};
-use fix_dict::Version;
+use fix_codec::{Fields, Message, UtcMillis, tag, write_utc_timestamp};
+use fix_dict::{Version, schema::Dictionary, value::matches_type};
 use fix_session::Role;
 
 use crate::{Result, invalid};
@@ -103,14 +103,7 @@ impl Application {
             return Err(invalid("The message has too many fields."));
         }
         for (number, value) in &fields {
-            let is_data = tag::DATA_FIELDS
-                .iter()
-                .any(|(len, data)| number == len || number == data);
-            if *number == 0
-                || dict.header.contains(*number)
-                || dict.trailer.contains(*number)
-                || is_data
-            {
+            if reserved(dict, *number) {
                 return Err(invalid(format!(
                     "Tag {number} is reserved or requires a length/data pair."
                 )));
@@ -127,6 +120,15 @@ impl Application {
             fields,
         })
     }
+}
+
+fn reserved(dict: &Dictionary, number: u32) -> bool {
+    number == 0
+        || dict.header.contains(number)
+        || dict.trailer.contains(number)
+        || tag::DATA_FIELDS
+            .iter()
+            .any(|&(length, data)| number == length || number == data)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,9 +162,51 @@ pub struct Order {
     pub kind: OrderKind,
     pub values: OrderValues,
     pub original: String,
+    carried: Vec<(u32, String)>,
 }
 
 impl Order {
+    pub fn new(kind: OrderKind, values: OrderValues, original: String) -> Self {
+        Self {
+            kind,
+            values,
+            original,
+            carried: Vec::new(),
+        }
+    }
+
+    pub fn from_sent(kind: OrderKind, version: Version, message: Message<'_>) -> Result<Self> {
+        let fields = message.fields();
+        if kind == OrderKind::Replace && fields.get(40) != Some(b"2") {
+            return Err(invalid(
+                "The compact Replace form requires a sent Limit order.",
+            ));
+        }
+        let value = |tag| {
+            fields
+                .get(tag)
+                .and_then(|raw| std::str::from_utf8(raw).ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let mut order = Self::new(
+            kind,
+            OrderValues {
+                symbol: value(55),
+                side: value(54),
+                quantity: value(38),
+                price: value(44),
+            },
+            value(11),
+        );
+        order.carried = selected_fields(version, kind, message)?;
+        Ok(order)
+    }
+
+    pub fn carried(&self) -> &[(u32, String)] {
+        &self.carried
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !wire_text(&self.values.symbol, 64) || !matches!(self.values.side.as_str(), "1" | "2") {
             return Err(invalid("Enter a symbol and select Buy or Sell."));
@@ -193,7 +237,7 @@ impl Order {
             fields.push((41, self.original.clone()));
         }
         if self.kind != OrderKind::Cancel {
-            if version != Version::Fix44 {
+            if version != Version::Fix44 && !self.carried.iter().any(|(tag, _)| *tag == 21) {
                 fields.push((21, "1".into()));
             }
             fields.extend([(40, "2".into()), (44, values.price.clone())]);
@@ -204,16 +248,91 @@ impl Order {
             (60, time),
             (38, values.quantity.clone()),
         ]);
-        Application::new(
-            version,
-            match self.kind {
-                OrderKind::New => "D",
-                OrderKind::Replace => "G",
-                OrderKind::Cancel => "F",
-            },
-            fields,
-        )
+        fields.extend_from_slice(&self.carried);
+        Application::new(version, self.kind.msg_type(), fields)
     }
+}
+
+impl OrderKind {
+    fn msg_type(self) -> &'static str {
+        match self {
+            Self::New => "D",
+            Self::Replace => "G",
+            Self::Cancel => "F",
+        }
+    }
+}
+
+fn selected_fields(
+    version: Version,
+    kind: OrderKind,
+    message: Message<'_>,
+) -> Result<Vec<(u32, String)>> {
+    let dict = version.dictionary();
+    let source_kind = std::str::from_utf8(message.msg_type()).unwrap_or_default();
+    let source = dict
+        .message(source_kind)
+        .ok_or_else(|| invalid("Unknown source order type."))?;
+    let target = dict
+        .message(kind.msg_type())
+        .ok_or_else(|| invalid("Unknown order type."))?;
+    let mut fields = message.fields();
+    let mut selected = Vec::new();
+    while let Some((number, raw)) = fields.iter().next() {
+        if let Some(definition) = source
+            .body
+            .group(number)
+            .or_else(|| target.body.group(number))
+        {
+            let length = group_length(fields, definition).ok_or_else(|| {
+                invalid(format!("The selected order has invalid group {number}."))
+            })?;
+            if let Some(destination) = target.body.group(number)
+                && group_length(fields, destination) == Some(length)
+                && !selected.iter().any(|(tag, _)| *tag == number)
+            {
+                selected.extend(
+                    fields
+                        .iter()
+                        .take(length)
+                        .map(|(tag, raw)| retained(dict, tag, raw))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            invalid(format!("Cannot carry group {number} into the new message."))
+                        })?,
+                );
+            }
+            fields = fields.skip(length);
+            continue;
+        }
+        if target.body.contains(number)
+            && !matches!(number, 11 | 38 | 40 | 41 | 44 | 54 | 55 | 60)
+            && !selected.iter().any(|(tag, _)| *tag == number)
+            && let Some(field) = retained(dict, number, raw)
+        {
+            selected.push(field);
+        }
+        fields = fields.skip(1);
+    }
+    Ok(selected)
+}
+
+fn group_length(fields: Fields<'_>, def: &fix_codec::GroupDef<'_>) -> Option<usize> {
+    fields
+        .group(def)
+        .ok()
+        .flatten()
+        .map(|group| group.entries().map(|entry| entry.len()).sum::<usize>() + 1)
+}
+
+fn retained(dict: &Dictionary, number: u32, raw: &[u8]) -> Option<(u32, String)> {
+    let value = std::str::from_utf8(raw).ok()?;
+    let field = dict.field(number)?;
+    (!reserved(dict, number)
+        && wire_text(value, TEXT_MAX)
+        && matches_type(field.ty, raw)
+        && field.accepts_value(value))
+    .then(|| (number, value.to_owned()))
 }
 
 fn positive_decimal(text: &str) -> bool {

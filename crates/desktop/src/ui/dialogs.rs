@@ -84,11 +84,7 @@ impl Workspace {
     pub(super) fn open_order(&mut self, kind: OrderKind, from_row: bool) {
         let Some(id) = self.selected else { return };
         self.notice.clear();
-        let mut order = Order {
-            kind,
-            original: String::new(),
-            values: OrderValues::default(),
-        };
+        let mut order = Order::new(kind, OrderValues::default(), String::new());
         if kind == OrderKind::New {
             match self.store.last_values(id, None) {
                 Ok(Some(values)) => order.values = values,
@@ -96,7 +92,11 @@ impl Workspace {
                 Err(error) => self.notice = error.to_string(),
             }
         } else if from_row {
-            self.fill_order_from_row(&mut order);
+            match self.order_from_row(kind) {
+                Ok(Some(selected)) => order = selected,
+                Ok(None) => {}
+                Err(error) => self.notice = error.to_string(),
+            }
         }
         self.dialog = Some(Dialog::Order(OrderDraft {
             id,
@@ -107,37 +107,27 @@ impl Workspace {
         }));
     }
 
-    fn fill_order_from_row(&self, order: &mut Order) {
+    fn order_from_row(&self, kind: OrderKind) -> Result<Option<Order>> {
+        let Some(saved) = self.selected() else {
+            return Ok(None);
+        };
         let Some(entry) = self
             .selected_row
             .and_then(|id| self.entries.iter().find(|row| row.id == id))
         else {
-            return;
+            return Ok(None);
         };
         if entry.direction != Direction::Sent
             || entry.status != "Sent"
             || !matches!(entry.kind.as_str(), "D" | "G")
         {
-            return;
+            return Ok(None);
         }
         let mut decoder = Decoder::new(FIELDS_MAX);
-        if let Ok(message) = decoder.decode(&entry.raw) {
-            let fields = message.fields();
-            let value = |tag| {
-                fields
-                    .get(tag)
-                    .and_then(|raw| std::str::from_utf8(raw).ok())
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            order.original = value(11);
-            order.values = OrderValues {
-                symbol: value(55),
-                side: value(54),
-                quantity: value(38),
-                price: value(44),
-            };
-        }
+        let message = decoder
+            .decode(&entry.raw)
+            .map_err(|error| invalid(format!("Cannot read selected order: {error:?}")))?;
+        Order::from_sent(kind, saved.profile.version, message).map(Some)
     }
 
     pub(super) fn open_tags(&mut self) {
@@ -229,8 +219,19 @@ impl Workspace {
         ui.add_space(6.0);
         self.order_fields(ui, draft);
         if kind != OrderKind::New && ui.link("Enter original details manually").clicked() {
-            draft.order.original.clear();
-            draft.order.values = OrderValues::default();
+            draft.order = Order::new(kind, OrderValues::default(), String::new());
+            self.notice.clear();
+        }
+        if !draft.order.carried().is_empty() {
+            egui::CollapsingHeader::new("Carried FIX fields").show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(108.0)
+                    .show(ui, |ui| {
+                        for (tag, value) in draft.order.carried() {
+                            ui.monospace(format!("{tag}={value}"));
+                        }
+                    });
+            });
         }
         if let Some(confirm) = submit(ui, "Send") {
             if !confirm {
@@ -306,7 +307,7 @@ impl Workspace {
         egui::Grid::new("tag-header").show(ui, |ui| {
             field(ui, "MsgType", &mut draft.kind, 16);
         });
-        ui.label(
+        let tag_label = ui.label(
             RichText::new("One Tag=Value pair per line. FIXTester adds the header and checksum.")
                 .color(MUTED),
         );
@@ -317,7 +318,8 @@ impl Workspace {
                 .desired_rows(9)
                 .char_limit(MESSAGE_MAX)
                 .hint_text("11=DEMO-1\n9001=Example"),
-        );
+        )
+        .labelled_by(tag_label.id);
         if let Some(confirm) = submit(ui, "Send") {
             if !confirm {
                 return false;

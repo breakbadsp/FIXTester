@@ -52,6 +52,14 @@ impl Wire {
     }
 
     pub fn send(&mut self, kind: &[u8], seq: u64, fields: &[(u32, &[u8])]) -> Vec<u8> {
+        let raw = self.message(kind, seq, fields);
+        // Split inside the body-length field.
+        self.stream.write_all(&raw[..10]).unwrap();
+        self.stream.write_all(&raw[10..]).unwrap();
+        raw
+    }
+
+    pub fn message(&self, kind: &[u8], seq: u64, fields: &[(u32, &[u8])]) -> Vec<u8> {
         let mut encoder = Encoder::new(16_384);
         let mut clock = [0; 21];
         let mut body = encoder.start(kind);
@@ -62,13 +70,9 @@ impl Wire {
         for &(tag, value) in fields {
             body.field(tag, value);
         }
-        let raw = body
-            .finish(self.profile.version.begin_string().as_bytes())
-            .unwrap();
-        // Split at a point inside the body-length field.
-        self.stream.write_all(&raw[..10]).unwrap();
-        self.stream.write_all(&raw[10..]).unwrap();
-        raw.to_vec()
+        body.finish(self.profile.version.begin_string().as_bytes())
+            .unwrap()
+            .to_vec()
     }
 
     pub fn logon(&mut self, seq: u64, reset: bool) {

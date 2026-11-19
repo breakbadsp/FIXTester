@@ -5,7 +5,8 @@
 
 use fix_codec::{Decoder, Encoder, UtcMillis, frame, write_utc_timestamp};
 use fix_session::{
-    Config, DisconnectReason, Disposition, Event, Role, SendError, SequenceNumbers, Session, State,
+    Config, DisconnectReason, Disposition, Event, Role, SendError, SequenceNumbers, Session,
+    SessionTime, State,
 };
 
 const T0: UtcMillis = UtcMillis(1_700_000_000_000);
@@ -1301,4 +1302,52 @@ fn resend_request_with_an_end_seq_no_that_is_not_a_number_is_rejected() {
     let wires = drain(&mut session);
     assert_eq!(kinds(&wires), ["3"], "no gap fill through the last message");
     assert_eq!(wires[0].num(373), Some(5));
+}
+
+#[test]
+fn wall_clock_rollback_preserves_elapsed_deadlines_and_utc_wire_time() {
+    let mut session = Session::new(config(Role::Initiator, V44), SequenceNumbers::default());
+    let before = SessionTime {
+        elapsed_ms: 0,
+        utc: T0,
+    };
+    session.on_connected_at(before);
+    let mut decoder = Decoder::new(64);
+    let logon = logon_reply(V44, 1, "30");
+    session.on_message_at(before, &decoder.decode(&logon).unwrap());
+    assert_eq!(session.state(), State::Active);
+    drain(&mut session);
+
+    let rolled_back = UtcMillis(T0.0 - 3_600_000);
+    let clock = |elapsed_ms| SessionTime {
+        elapsed_ms,
+        utc: rolled_back,
+    };
+    assert_eq!(session.next_deadline_ms(), Some(30_000));
+    session.on_timer_at(clock(29_999));
+    assert!(drain(&mut session).is_empty());
+    session.on_timer_at(clock(30_000));
+    let wires = drain(&mut session);
+    assert_eq!(kinds(&wires), ["0"]);
+    assert_eq!(wires[0].get(52), Some("20231114-21:13:20.000"));
+
+    let heartbeat = from_peer("0", 2, rolled_back, &[]);
+    session.on_message_at(clock(30_001), &decoder.decode(&heartbeat).unwrap());
+    assert_eq!(session.sequence_numbers().next_target, 3);
+    assert_eq!(session.state(), State::Active);
+    session.on_timer_at(clock(60_000));
+    assert_eq!(kinds(&drain(&mut session)), ["0"]);
+    assert_eq!(session.next_deadline_ms(), Some(66_001));
+    session.on_timer_at(clock(66_001));
+    let request = drain(&mut session);
+    assert_eq!(kinds(&request), ["1"]);
+    assert_eq!(request[0].get(52), Some("20231114-21:13:20.000"));
+    session.on_timer_at(clock(96_001));
+    assert!(session.disconnect_requested());
+    assert_eq!(
+        events(&mut session).last(),
+        Some(&Event::DisconnectRequested(
+            DisconnectReason::HeartbeatTimeout
+        ))
+    );
 }

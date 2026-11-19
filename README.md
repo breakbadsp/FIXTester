@@ -19,6 +19,10 @@ history locally with bundled SQLite.
 
 FIXTester manages Logon, Heartbeat, TestRequest, Logout, and resend
 requests. It replies with gap fills and does not replay orders.
+A frame with a known boundary and a bad checksum stays in history.
+Recovery can continue on the same connection. An unknown frame boundary
+closes the connection. Session deadlines use elapsed time. FIX timestamps
+use UTC.
 If a connection closes, an acceptor resumes listening. For an initiator,
 select **Connect** again. Select **Stop** to send Logout and stop the
 connection or listener.
@@ -53,7 +57,9 @@ symbol and leave its field to recall that symbol's values, if available.
 Select a received Execution Report to see its status, quantity, price,
 and reject details. Select a sent New or Replace to open **Use for
 replace** or **Use for cancel**. The form copies that message's ClOrdID
-and order fields. For a price change, edit the limit price and send.
+and order fields. Replace carries valid standard instructions that the
+replacement supports. Expand **Carried FIX fields** to inspect them.
+For a price change, edit the limit price and send.
 Select the sent replacement before opening Cancel to use its ClOrdID.
 For a manual reference, open Replace or Cancel and enter OrigClOrdID and
 the order fields. FIXTester generates each new ClOrdID.
@@ -93,8 +99,8 @@ from the sent rows as described above.
 The timeline searches the selected profile for tags, values, summaries,
 or transfer status. Filter by direction or show application messages
 only. Use **Raw** to display exact bytes with `\xNN` escapes. **Export…**
-writes matching captured bytes in timeline order to a new file and
-keeps the SOH bytes. It includes any captured fragment. A partial write
+writes matching captured bytes from one database snapshot in timeline
+order to a new file and keeps the SOH bytes. It includes any captured fragment. A partial write
 exports only the prefix that TCP accepted. An unconfirmed send keeps the
 planned frame for inspection. TCP write success does not prove peer receipt.
 

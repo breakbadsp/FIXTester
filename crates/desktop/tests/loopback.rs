@@ -105,11 +105,7 @@ fn order_flow_over_tcp_in_every_version_and_role() {
             sessions
                 .send(
                     id,
-                    Send::Order(Order {
-                        kind: OrderKind::New,
-                        values: values.clone(),
-                        original: String::new(),
-                    }),
+                    Send::Order(Order::new(OrderKind::New, values.clone(), String::new())),
                 )
                 .unwrap();
             let new = wire.receive(b"D", 2);
@@ -138,11 +134,11 @@ fn order_flow_over_tcp_in_every_version_and_role() {
             sessions
                 .send(
                     id,
-                    Send::Order(Order {
-                        kind: OrderKind::Replace,
-                        values: values.clone(),
-                        original: String::from_utf8_lossy(&new_id).into_owned(),
-                    }),
+                    Send::Order(Order::new(
+                        OrderKind::Replace,
+                        values.clone(),
+                        String::from_utf8_lossy(&new_id).into_owned(),
+                    )),
                 )
                 .unwrap();
             let replace = wire.receive(b"G", 3);
@@ -161,11 +157,11 @@ fn order_flow_over_tcp_in_every_version_and_role() {
             sessions
                 .send(
                     id,
-                    Send::Order(Order {
-                        kind: OrderKind::Cancel,
-                        values: values.clone(),
-                        original: String::from_utf8_lossy(&replace_id).into_owned(),
-                    }),
+                    Send::Order(Order::new(
+                        OrderKind::Cancel,
+                        values.clone(),
+                        String::from_utf8_lossy(&replace_id).into_owned(),
+                    )),
                 )
                 .unwrap();
             let cancel = wire.receive(b"F", 4);
@@ -389,5 +385,81 @@ fn acceptor_requires_armed_reset_and_reconnects_after_heartbeat_timeout() {
     });
     let mut peer = connect(&sessions, &saved, None);
     handshake(&sessions, id, &mut peer, 6, 3, false);
+    assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 4);
+}
+
+#[test]
+fn checksum_error_preserves_the_following_frame_and_requests_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = reserve();
+    let (db, store, saved) = setup(
+        dir.path(),
+        profile(
+            Role::Initiator,
+            Version::Fix44,
+            listener.local_addr().unwrap(),
+            1,
+        ),
+    );
+    let id = saved.id;
+    let mut sessions = Sessions::new(&db);
+    sessions.start(&store, saved.clone()).unwrap();
+    let mut peer = connect(&sessions, &saved, Some(&listener));
+    handshake(&sessions, id, &mut peer, 1, 1, false);
+
+    let mut bad = peer.message(b"8", 2, &[(11, b"CORRUPTED"), (150, b"0")]);
+    let checksum_digit = bad.len() - 2;
+    bad[checksum_digit] = if bad[checksum_digit] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
+    let good = peer.message(b"8", 3, &[(11, b"NEXT"), (150, b"0")]);
+    peer.stream
+        .write_all(&[bad.as_slice(), good.as_slice()].concat())
+        .unwrap();
+    let resend = peer.receive(b"2", 2);
+    let mut decoder = Decoder::new(256);
+    assert_eq!(
+        decoder.decode(&resend).unwrap().fields().get_u64(7),
+        Some(2)
+    );
+    let rows = store
+        .history(
+            id,
+            &Filter {
+                direction: Some(Direction::Received),
+                text: String::new(),
+                application_only: true,
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].raw, good);
+    assert_eq!(rows[0].status, "Received");
+    assert_eq!(rows[1].raw, bad);
+    assert_eq!(rows[1].status, "Invalid checksum");
+    assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 2);
+
+    let mut timestamp = [0; 21];
+    peer.send(
+        b"4",
+        2,
+        &[
+            (43, b"Y"),
+            (122, write_utc_timestamp(now(), &mut timestamp)),
+            (123, b"Y"),
+            (36, b"4"),
+        ],
+    );
+    wait(|| store.checkpoint(id).unwrap().seq.next_target == 4);
+    assert!(sessions.is_running(id));
+
+    let malformed = [b"8=FIX.4.4\x019=X\x01".as_slice(), &good].concat();
+    peer.stream.write_all(&malformed).unwrap();
+    wait(|| !sessions.is_running(id));
+    let rows = store.history(id, &Filter::default(), None).unwrap();
+    assert_eq!(rows[0].status, "Invalid frame");
     assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 4);
 }

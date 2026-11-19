@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -246,10 +245,14 @@ impl Store {
     }
 
     pub fn purge(&self) -> Result<()> {
+        self.purge_before(retention_cutoff())
+    }
+
+    fn purge_before(&self, cutoff: u64) -> Result<()> {
         // Delete in batches so that other connections can commit between batches.
         self.0.execute(
             "DELETE FROM history WHERE id IN (SELECT id FROM history WHERE time_ms<?1 LIMIT 4096)",
-            [now().0.saturating_sub(RETENTION_MS)],
+            [cutoff],
         )?;
         Ok(())
     }
@@ -285,21 +288,17 @@ impl Store {
         Ok(count)
     }
 
-    fn write_export(&self, id: i64, filter: &Filter, file: &mut File) -> Result<usize> {
-        let last: i64 = self
-            .0
-            .query_row("SELECT coalesce(max(id),0) FROM history", [], |row| {
-                row.get(0)
-            })?;
+    fn write_export(&self, id: i64, filter: &Filter, file: &mut impl Write) -> Result<usize> {
         let cutoff = retention_cutoff();
-        let mut query = self.0.prepare(&format!(
+        // Keep one read transaction so later pages see the same rows after retention runs.
+        let snapshot = self.0.unchecked_transaction()?;
+        let mut query = snapshot.prepare(&format!(
             "SELECT id,substr(raw,1,transferred) {WHERE_HISTORY}
-             AND transferred>0 AND id>?6 AND id<=?7 ORDER BY id LIMIT {PAGE_ROWS}",
+             AND transferred>0 AND id>?6 ORDER BY id LIMIT {PAGE_ROWS}",
         ))?;
         let mut count = 0;
         let mut after = 0;
         loop {
-            // Release the read snapshot before writing to disk so WAL checkpoints can run.
             let (next, bytes, length) = {
                 let mut rows = query.query(params![
                     id,
@@ -308,7 +307,6 @@ impl Store {
                     filter.application_only,
                     cutoff,
                     after,
-                    last,
                 ])?;
                 let mut bytes = Vec::new();
                 let mut length = 0;
@@ -442,4 +440,102 @@ pub fn escape(bytes: &[u8]) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    struct PurgeBetweenPages<'a> {
+        store: &'a Store,
+        profile: i64,
+        cutoff: u64,
+        output: Vec<u8>,
+    }
+
+    impl Write for PurgeBetweenPages<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            if self.output.len() == bytes.len() {
+                self.store
+                    .purge_before(self.cutoff)
+                    .map_err(std::io::Error::other)?;
+                assert!(
+                    self.store
+                        .history(self.profile, &Filter::default(), None)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn export_keeps_its_initial_matches_when_retention_runs_between_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("test.db");
+        let mut exporter = Store::open(&database).unwrap();
+        let purger = Store::open(&database).unwrap();
+        let id = exporter
+            .save_profile(
+                None,
+                &Profile {
+                    name: "Export".into(),
+                    version: Version::Fix44,
+                    sender: "TEST".into(),
+                    target: "PEER".into(),
+                    role: Role::Initiator,
+                    address: "127.0.0.1:9876".parse().unwrap(),
+                    heartbeat: 30,
+                },
+            )
+            .unwrap();
+        let time = now();
+        let mut expected = Vec::new();
+        let rows = (PAGE_ROWS * 2 + 1) as usize;
+        for i in 0..rows {
+            let raw = format!("Captured bytes {i}\x01");
+            exporter
+                .commit(
+                    id,
+                    Transition {
+                        time,
+                        checkpoint: exporter.checkpoint(id).unwrap(),
+                        received: Some(Packet {
+                            raw: raw.as_bytes(),
+                            direction: Direction::Received,
+                            status: "Incomplete frame",
+                        }),
+                        outgoing: &[],
+                        values: None,
+                    },
+                )
+                .unwrap();
+            expected.extend_from_slice(raw.as_bytes());
+        }
+        let mut sink = PurgeBetweenPages {
+            store: &purger,
+            profile: id,
+            cutoff: time.0 + 1,
+            output: Vec::new(),
+        };
+        let count = exporter
+            .write_export(id, &Filter::default(), &mut sink)
+            .unwrap();
+        assert_eq!(count, rows);
+        assert_eq!(sink.output, expected);
+        assert!(
+            exporter
+                .history(id, &Filter::default(), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

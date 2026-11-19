@@ -2,8 +2,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use fix_codec::{Decoder, Message, UtcMillis, frame, tag};
-use fix_session::{Config, Event, Role, Session, State};
+use fix_codec::{Decoder, Message, UtcMillis, frame, frame_with_checksum, tag};
+use fix_session::{Config, Event, Role, Session, SessionTime, State};
 
 use super::{Control, POLL, Phase, Send};
 use crate::model::{FIELDS_MAX, MESSAGE_MAX, OrderKind, OrderValues, now};
@@ -17,6 +17,7 @@ const SEQ_MAX: u64 = (i64::MAX - 1) as u64;
 
 struct Peer<'a> {
     stream: TcpStream,
+    epoch: Instant,
     session: Session,
     reset_expected: bool,
     reset_armed: bool,
@@ -52,6 +53,7 @@ pub(super) fn connect(
     config.output_len_max = 4 * MESSAGE_MAX;
     let mut peer = Peer {
         stream,
+        epoch: Instant::now(),
         session: Session::new(config, checkpoint.seq),
         reset_expected: checkpoint.reset,
         reset_armed: checkpoint.reset && profile.role == Role::Acceptor,
@@ -63,9 +65,9 @@ pub(super) fn connect(
         control,
     };
     control.update(|status| status.notice.clear());
-    let time = now();
-    peer.session.on_connected(time);
-    peer.commit(time, None, None)?;
+    let time = peer.time();
+    peer.session.on_connected_at(time);
+    peer.commit(time.utc, None, None)?;
     let result = peer.run();
     if !peer.input.is_empty() && !matches!(result, Err(Error::Database(_))) {
         let raw = std::mem::take(&mut peer.input);
@@ -75,6 +77,13 @@ pub(super) fn connect(
 }
 
 impl Peer<'_> {
+    fn time(&self) -> SessionTime {
+        SessionTime {
+            elapsed_ms: u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX),
+            utc: now(),
+        }
+    }
+
     fn run(&mut self) -> Result<()> {
         let mut chunk = [0; CHUNK];
         let mut partial_since = None::<Instant>;
@@ -85,10 +94,14 @@ impl Peer<'_> {
             if let Ok(command) = self.control.commands.try_recv() {
                 self.send(command)?;
             }
-            let time = now();
-            if self.session.next_deadline().is_some_and(|due| due <= time) {
-                self.session.on_timer(time);
-                self.commit(time, None, None)?;
+            let time = self.time();
+            if self
+                .session
+                .next_deadline_ms()
+                .is_some_and(|due| due <= time.elapsed_ms)
+            {
+                self.session.on_timer_at(time);
+                self.commit(time.utc, None, None)?;
                 continue;
             }
             match self.stream.read(&mut chunk) {
@@ -126,9 +139,9 @@ impl Peer<'_> {
     fn stop(&mut self) -> Result<bool> {
         match self.session.state() {
             State::Active => {
-                let time = now();
-                self.session.logout(time, b"");
-                self.commit(time, None, None)?;
+                let time = self.time();
+                self.session.logout_at(time, b"");
+                self.commit(time.utc, None, None)?;
                 Ok(true)
             }
             State::LogoutSent => Ok(true),
@@ -152,8 +165,8 @@ impl Peer<'_> {
                 *offset = bytes.len();
                 return self.commit(now(), Some((rest, "After disconnect")), None);
             }
-            let size = match frame(rest, MESSAGE_MAX) {
-                Ok(Some(size)) => size,
+            let framed = match frame_with_checksum(rest, MESSAGE_MAX) {
+                Ok(Some(framed)) => framed,
                 Ok(None) => return Ok(()),
                 Err(error) => {
                     *offset = bytes.len();
@@ -161,40 +174,40 @@ impl Peer<'_> {
                     return Err(invalid(format!("Invalid FIX frame: {error:?}")));
                 }
             };
-            *offset += size;
-            self.receive_message(&rest[..size])?;
+            *offset += framed.len;
+            let raw = &rest[..framed.len];
+            if framed.checksum.is_ok() {
+                self.receive_message(raw)?;
+            } else {
+                self.commit(now(), Some((raw, "Invalid checksum")), None)?;
+            }
         }
         Ok(())
     }
 
     fn receive_message(&mut self, raw: &[u8]) -> Result<()> {
-        let time = now();
-        let result = self
-            .decoder
-            .decode(raw)
-            .map_err(|error| invalid(format!("Invalid FIX fields: {error:?}")))
-            .and_then(|message| {
-                check_receive(self.session.state(), self.reset_expected, &message)?;
-                self.session.on_message(time, &message);
-                Ok(())
-            });
-        if let Err(error) = result {
-            self.commit(time, Some((raw, "Rejected input")), None)?;
+        let time = self.time();
+        let Ok(message) = self.decoder.decode(raw) else {
+            return self.commit(time.utc, Some((raw, "Invalid fields")), None);
+        };
+        if let Err(error) = check_receive(self.session.state(), self.reset_expected, &message) {
+            self.commit(time.utc, Some((raw, "Rejected input")), None)?;
             return Err(error);
         }
+        self.session.on_message_at(time, &message);
         if self.session.state() == State::Active {
             self.reset_armed = false;
         }
-        self.commit(time, Some((raw, "Received")), None)
+        self.commit(time.utc, Some((raw, "Received")), None)
     }
 
     fn send(&mut self, command: Send) -> Result<()> {
-        let time = now();
+        let time = self.time();
         let result = self
-            .prepare(command, time)
+            .prepare(command, time.utc)
             .and_then(|(application, values)| {
                 self.session
-                    .send_app(time, application.kind.as_bytes(), |body| {
+                    .send_app_at(time, application.kind.as_bytes(), |body| {
                         for (tag, value) in &application.fields {
                             body.field(*tag, value.as_bytes());
                         }
@@ -205,7 +218,7 @@ impl Peer<'_> {
                 Ok(values)
             });
         let result = match result {
-            Ok(values) => self.commit(time, None, values.as_ref()),
+            Ok(values) => self.commit(time.utc, None, values.as_ref()),
             Err(error @ Error::Database(_)) => return Err(error),
             Err(error) => {
                 self.complete_command(Some(error.to_string()));
