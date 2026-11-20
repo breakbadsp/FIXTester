@@ -12,7 +12,14 @@ use std::time::Duration;
 
 use fix_session::{Role, SequenceNumbers, State};
 
-use crate::model::{Application, Order, SESSIONS_MAX, execution::Report, grouped::GroupedOrder};
+use crate::model::{
+    Application, Order, SESSIONS_MAX,
+    execution::{
+        Report,
+        automation::{Rules, Settings},
+    },
+    grouped::GroupedOrder,
+};
 use crate::store::{SavedProfile, Store};
 use crate::{Result, invalid};
 
@@ -117,7 +124,21 @@ impl Sessions {
     }
 
     pub fn start(&mut self, store: &Store, saved: SavedProfile) -> Result<()> {
+        self.start_with_automation(store, saved, &Settings::default())
+    }
+
+    pub fn start_with_automation(
+        &mut self,
+        store: &Store,
+        saved: SavedProfile,
+        settings: &Settings,
+    ) -> Result<()> {
         self.require_stopped(saved.id)?;
+        let rules = if saved.profile.role == Role::Acceptor {
+            settings.compile()?
+        } else {
+            None
+        };
         if self.count() == SESSIONS_MAX {
             return Err(invalid(
                 "Eight sessions are already running. Stop one to start another.",
@@ -136,6 +157,7 @@ impl Sessions {
             stop: Arc::clone(&stop),
             status: Arc::clone(&status),
             commands,
+            rules,
         };
         let thread = thread::Builder::new()
             .name(format!("fix-session-{id}"))
@@ -230,6 +252,7 @@ struct Control {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
     commands: Receiver<SendRequest>,
+    rules: Option<Rules>,
 }
 
 impl Control {

@@ -1,6 +1,7 @@
 mod dialogs;
 mod timeline;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -13,7 +14,7 @@ use eframe::egui::{self, Color32, Key, Modifiers, RichText, TextStyle};
 use fix_dict::Version;
 use fix_session::{Role, State};
 use fixtester_desktop::Result;
-use fixtester_desktop::model::{OrderKind, SESSIONS_MAX};
+use fixtester_desktop::model::{OrderKind, SESSIONS_MAX, execution::automation::Settings};
 use fixtester_desktop::store::{Entry, Filter, SavedProfile, Store};
 use fixtester_desktop::transport::{Phase, Sessions, Status};
 
@@ -51,6 +52,7 @@ pub fn style(ctx: &egui::Context) {
 pub struct Workspace {
     store: Store,
     sessions: Sessions,
+    automation: BTreeMap<i64, Settings>,
     profiles: Vec<SavedProfile>,
     selected: Option<i64>,
     entries: Vec<Entry>,
@@ -78,6 +80,7 @@ impl Workspace {
         Ok(Self {
             store,
             sessions: Sessions::default(),
+            automation: BTreeMap::new(),
             profiles,
             selected,
             entries: Vec::new(),
@@ -153,11 +156,36 @@ impl Workspace {
         };
         if self.sessions.is_running(saved.id) {
             self.sessions.stop(saved.id);
+            self.disarm_automation(saved.id);
             self.notice = "Stopping session…".into();
         } else {
-            let result = self.sessions.start(&self.store, saved);
+            let settings = self.automation.get(&saved.id).cloned().unwrap_or_default();
+            let result = self
+                .sessions
+                .start_with_automation(&self.store, saved, &settings);
             self.show_result(result);
             self.refresh = true;
+        }
+    }
+
+    fn automation_button(&mut self, ui: &mut egui::Ui, id: i64) {
+        let enabled = self
+            .automation
+            .get(&id)
+            .is_some_and(|settings| settings.enabled);
+        let label = if enabled {
+            "Automation on"
+        } else {
+            "Automation off"
+        };
+        if ui.button(label).clicked() {
+            self.dialog = Some(Dialog::Automation(id));
+        }
+    }
+
+    fn disarm_automation(&mut self, id: i64) {
+        if let Some(settings) = self.automation.get_mut(&id) {
+            settings.enabled = false;
         }
     }
 
@@ -307,6 +335,9 @@ impl Workspace {
                 .clicked()
             {
                 self.start_stop();
+            }
+            if saved.profile.role == Role::Acceptor {
+                self.automation_button(ui, saved.id);
             }
             if ui
                 .add_enabled(!running, egui::Button::new("Edit profile"))

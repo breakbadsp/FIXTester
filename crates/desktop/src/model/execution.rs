@@ -1,4 +1,5 @@
 mod action;
+pub mod automation;
 mod context;
 
 pub use action::Action;
@@ -36,40 +37,58 @@ impl Report {
             ));
         }
         let order = context.order(child)?;
-        let mut report = Self {
-            action,
-            version: context.version,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            multileg: order.value(442) == "3" || (order.multileg && order.value(442) != "2"),
-        };
         let order_id = if context.source.assigns_order_id() {
             context.order_id(child)
         } else {
             order.value(37).to_owned()
         };
-        report.field(37, order_id, true, false);
-        report.field(11, order.value(11), true, false);
-        if context.source.request_chain() {
-            report.field(41, order.value(41), true, false);
-        }
-        report.field(39, action.status(context.version), true, false);
         let list_id = if context.source == Source::List {
             &context.list_id
         } else {
             order.value(66)
         };
+        Ok(Self::for_order(
+            context.version,
+            context.source,
+            order,
+            &order_id,
+            list_id,
+            action,
+        ))
+    }
+
+    fn for_order(
+        version: Version,
+        source: Source,
+        order: &context::OrderContext,
+        order_id: &str,
+        list_id: &str,
+        action: Action,
+    ) -> Self {
+        let mut report = Self {
+            action,
+            version,
+            fields: Vec::new(),
+            groups: Vec::new(),
+            multileg: order.value(442) == "3" || (order.multileg && order.value(442) != "2"),
+        };
+        report.field(37, order_id, true, false);
+        report.field(11, order.value(11), true, false);
+        if source.request_chain() {
+            report.field(41, order.value(41), true, false);
+        }
+        report.field(39, action.status(version), true, false);
         report.field(66, list_id, !list_id.is_empty(), true);
         if action.cancel_reject().is_some() {
             report.field(102, "", false, false);
         } else {
-            report.execution_fields(context, order);
+            report.execution_fields(source, order);
         }
         report.field(58, "", false, true);
-        Ok(report)
+        report
     }
 
-    fn execution_fields(&mut self, context: &Context, order: &context::OrderContext) {
+    fn execution_fields(&mut self, source: Source, order: &context::OrderContext) {
         use Action::{
             Acknowledge, Calculated, Cancel, DoneForDay, Expire, FullFill, PendingNew,
             PendingReplace, Reject, Restate, Status, Stopped,
@@ -99,7 +118,7 @@ impl Report {
             self.field(31, "", action.has_trade_values(), false);
         }
         if action.references_trade() {
-            let reference = if context.source == Source::Trade {
+            let reference = if source == Source::Trade {
                 order.value(17)
             } else {
                 ""
@@ -174,6 +193,12 @@ impl Report {
 
     pub fn version(&self) -> Version {
         self.version
+    }
+
+    fn set(&mut self, tag: u32, value: impl Into<String>) {
+        if let Some(field) = self.fields.iter_mut().find(|field| field.tag == tag) {
+            field.value = value.into();
+        }
     }
 
     fn value(&self, tag: u32) -> &str {

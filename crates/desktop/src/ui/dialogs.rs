@@ -1,4 +1,5 @@
 mod additional;
+mod automation;
 pub(super) mod execution;
 mod grouped;
 
@@ -24,6 +25,7 @@ pub(super) enum Dialog {
     Tags(TagDraft),
     Grouped(grouped::GroupedDraft),
     Execution(execution::ExecutionDraft),
+    Automation(i64),
     Reset(i64),
     Export(String),
 }
@@ -186,6 +188,7 @@ impl Workspace {
                 Dialog::Grouped(draft) => open = self.grouped_dialog(ui, draft),
                 Dialog::Execution(draft) => open = self.execution_dialog(ui, draft),
                 Dialog::Profile(draft) => open = self.profile_dialog(ui, draft),
+                Dialog::Automation(id) => open = self.automation_dialog(ui, *id),
                 Dialog::Reset(id) => open = self.reset_dialog(ui, *id),
                 Dialog::Export(path) => open = self.export_dialog(ui, path),
             }
@@ -416,6 +419,7 @@ impl Workspace {
         };
         let id = self.store.save_profile(draft.id, &profile)?;
         self.profiles = self.store.profiles()?;
+        self.disarm_automation(id);
         self.select(id);
         Ok(())
     }
@@ -426,7 +430,10 @@ impl Workspace {
         match submit(ui, "Reset to 1") {
             Some(false) => false,
             Some(true) => match self.sessions.reset(&self.store, id) {
-                Ok(()) => false,
+                Ok(()) => {
+                    self.disarm_automation(id);
+                    false
+                }
                 Err(error) => {
                     self.notice = error.to_string();
                     true
