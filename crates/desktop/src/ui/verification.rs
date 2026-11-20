@@ -749,7 +749,7 @@ fn fix42_correction_and_bust_use_resulting_fill_type_and_exec_ref() {
     assert_eq!(fields.get(151), Some(b"0".as_slice()));
     ui.wait_for_workspace();
 
-    ui.click("ExecutionReport");
+    ui.click(&format!("TX  {:>6}  ExecutionReport", 2));
     ui.click("Execution actions");
     ui.click("Trade correction");
     choose_status(&mut ui, "1 · PartiallyFilled");
@@ -774,7 +774,7 @@ fn fix42_correction_and_bust_use_resulting_fill_type_and_exec_ref() {
     }
     let correction_id = fields.get(17).unwrap().to_vec();
     ui.wait_for_workspace();
-    ui.click("ExecutionReport");
+    ui.click(&format!("TX  {:>6}  ExecutionReport", 3));
     ui.click("Execution actions");
     ui.click("Trade bust");
     choose_status(&mut ui, "4 · Canceled");
@@ -793,6 +793,53 @@ fn fix42_correction_and_bust_use_resulting_fill_type_and_exec_ref() {
         (32, b"0"),
     ] {
         assert_eq!(fields.get(tag), Some(value));
+    }
+}
+
+#[test]
+fn fix42_busting_full_fill_reports_resulting_partial_fill() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) =
+        connected_workspace_version(&dir.path().join("fix42-bust.db"), Version::Fix42);
+    peer.send(
+        b"D",
+        2,
+        &[(11, b"BUST-ME"), (55, b"XYZ"), (54, b"1"), (38, b"10")],
+    );
+    ui.click("OrderSingle");
+    ui.click("Execution actions");
+    ui.click("Full fill");
+    ui.enter("CumQty", "10");
+    ui.enter("AvgPx", "100");
+    ui.enter("LastShares", "2");
+    ui.enter("LastPx", "100");
+    ui.click("Send");
+    let mut decoder = Decoder::new(256);
+    let raw = peer.receive(b"8", 2);
+    let full = decoder.decode(&raw).unwrap().fields();
+    assert_eq!(full.get(150), Some(b"2".as_slice()));
+    let full_id = full.get(17).unwrap().to_vec();
+
+    ui.wait_for_workspace();
+    ui.click(&format!("TX  {:>6}  ExecutionReport", 2));
+    ui.click("Execution actions");
+    ui.click("Trade bust");
+    choose_status(&mut ui, "1 · PartiallyFilled");
+    ui.enter("CumQty", "8");
+    ui.enter("LeavesQty", "2");
+    ui.enter("AvgPx", "100");
+    ui.click("Send");
+    let raw = peer.receive(b"8", 3);
+    let bust = decoder.decode(&raw).unwrap().fields();
+    for (tag, expected) in [
+        (20, b"1".as_slice()),
+        (150, b"1"),
+        (39, b"1"),
+        (19, full_id.as_slice()),
+        (14, b"8"),
+        (151, b"2"),
+    ] {
+        assert_eq!(bust.get(tag), Some(expected));
     }
 }
 
