@@ -78,6 +78,14 @@ Enter 1 to 16 single Limit orders with no bidding process. FIXTester
 assigns the list ID, the order IDs, and the group counts. Use the tag
 editor when a venue requires fields outside these dialogs.
 
+Open **Additional FIX tags** in any guided message to add optional
+top-level fields. Use semicolons between the pairs, for example
+`29=2;58=Test fill` on a report. A final semicolon is permitted.
+FIXTester trims ASCII spaces around each tag and value. Other bytes
+remain the same. The field only adds tags to the current draft. Edit
+existing values in their form fields. FIXTester rejects duplicates,
+protected tags, and tags that belong to repeating groups.
+
 ### Reply to received orders
 
 On an active session, right-click a received order in the timeline or

@@ -126,6 +126,12 @@ impl Driver {
         self.replace_text(text);
     }
 
+    fn enter_additional_tags(&mut self, text: &str) {
+        let disclosure = self.wait_for(accesskit::Role::DisclosureTriangle, "Additional FIX tags");
+        self.action(disclosure, accesskit::Action::Click);
+        self.enter("Tag=Value pairs separated by semicolons", text);
+    }
+
     fn wait_for_workspace(&mut self) {
         let since = Instant::now();
         loop {
@@ -228,23 +234,36 @@ fn workspace_sends_a_multileg_order_and_an_order_list() {
     ui.enter("Leg 1 maturity", "202712");
     ui.enter("Leg 2 symbol", "FUT-H");
     ui.enter("Leg 2 maturity", "202803");
+    ui.enter_additional_tags("9001=Strategy");
     ui.click("Send");
 
     let raw = peer.receive(b"AB", 2);
     let mut decoder = Decoder::new(256);
     let fields = decoder.decode(&raw).unwrap().fields();
     assert_eq!(fields.get_u64(555), Some(2));
+    assert_eq!(fields.get(9001), Some(b"Strategy".as_slice()));
+    assert!(
+        fields.iter().position(|(tag, _)| tag == 9001).unwrap()
+            < fields.iter().position(|(tag, _)| tag == 555).unwrap()
+    );
     assert_eq!(fields.get(461), Some(b"FMXXXX".as_slice()));
     assert_eq!(fields.get(44), Some(b"-0.25".as_slice()));
     ui.click("Order list");
     ui.enter("Symbol", "ALPHA");
     ui.enter("Quantity", "12");
     ui.enter("Limit price", "19.50");
+    ui.enter_additional_tags("9002=List");
     ui.click("Send");
 
     let raw = peer.receive(b"E", 3);
     let fields = decoder.decode(&raw).unwrap().fields();
     assert_eq!(fields.get_u64(73), Some(1));
+    assert_eq!(fields.get(9001), None);
+    assert_eq!(fields.get(9002), Some(b"List".as_slice()));
+    assert!(
+        fields.iter().position(|(tag, _)| tag == 9002).unwrap()
+            < fields.iter().position(|(tag, _)| tag == 73).unwrap()
+    );
     assert_eq!(fields.get(55), Some(b"ALPHA".as_slice()));
     assert_eq!(fields.get(44), Some(b"19.50".as_slice()));
 }
@@ -269,6 +288,7 @@ fn order_flow(from_tags: bool) {
         ui.enter("Symbol", "WIDGET");
         ui.enter("Quantity", "40");
         ui.enter("Limit price", "19.50");
+        ui.enter_additional_tags("9003=Guided limit");
     }
     ui.click("Send");
     let raw = peer.receive(b"D", 2);
@@ -278,6 +298,9 @@ fn order_flow(from_tags: bool) {
     let original = fields.get(11).unwrap().to_vec();
     assert_eq!(fields.get(55), Some(&b"WIDGET"[..]));
     assert_eq!(fields.get(44), Some(&b"19.50"[..]));
+    if !from_tags {
+        assert_eq!(fields.get(9003), Some(b"Guided limit".as_slice()));
+    }
     peer.send(
         b"8",
         2,
@@ -302,6 +325,7 @@ fn order_flow(from_tags: bool) {
     ui.key(Key::R, Modifiers::CTRL);
     ui.assert_selected_reference(&original);
     ui.enter("Limit price", "19.75");
+    ui.enter_additional_tags("9003=Guided replace");
     ui.click("Send");
     let raw = peer.receive(b"G", 3);
     ui.wait_for_workspace();
@@ -309,6 +333,7 @@ fn order_flow(from_tags: bool) {
     assert_eq!(fields.get(41), Some(original.as_slice()));
     assert_eq!(fields.get(38), Some(&b"40"[..]));
     assert_eq!(fields.get(44), Some(&b"19.75"[..]));
+    assert_eq!(fields.get(9003), Some(b"Guided replace".as_slice()));
     if from_tags {
         assert_eq!(fields.get(18), Some(&b"6"[..]));
         assert_eq!(fields.get(59), Some(&b"1"[..]));
@@ -330,13 +355,13 @@ fn order_flow(from_tags: bool) {
     ui.click("OrderCancelReplaceRequest");
     ui.key(Key::K, Modifiers::CTRL);
     ui.assert_selected_reference(&replace);
+    ui.enter_additional_tags("9003=Guided cancel");
     ui.click("Send");
     let raw = peer.receive(b"F", 4);
     ui.wait_for_workspace();
-    assert_eq!(
-        decoder.decode(&raw).unwrap().fields().get(41),
-        Some(replace.as_slice())
-    );
+    let fields = decoder.decode(&raw).unwrap().fields();
+    assert_eq!(fields.get(41), Some(replace.as_slice()));
+    assert_eq!(fields.get(9003), Some(b"Guided cancel".as_slice()));
     if from_tags {
         manual_replace(&mut ui, &mut peer, &replace);
     }
@@ -450,6 +475,13 @@ fn execution_context_menu_sends_reports_and_uses_sent_trade_reference() {
     ui.enter("AvgPx", "19.25");
     ui.enter("LastQty", "2");
     ui.enter("LastPx", "19.25");
+    ui.enter_additional_tags("35=8");
+    ui.click("Send");
+    ui.wait_for(accesskit::Role::Label, "Tag 35 is reserved");
+    ui.enter(
+        "Tag=Value pairs separated by semicolons",
+        " 29=2 ; 58=Test fill=2; ",
+    );
     ui.click("Send");
 
     let raw = peer.receive(b"8", 3);
@@ -463,6 +495,8 @@ fn execution_context_menu_sends_reports_and_uses_sent_trade_reference() {
         (39, b"1"),
         (32, b"2"),
         (31, b"19.25"),
+        (29, b"2"),
+        (58, b"Test fill=2"),
     ] {
         assert_eq!(trade.get(tag), Some(value));
     }
@@ -603,6 +637,7 @@ fn multileg_execution_and_replace_reject_keep_references() {
     assert!(ui.find(accesskit::Role::Button, "Reject order").is_none());
     ui.click("Reject replace request");
     choose_status(&mut ui, "0 · New");
+    ui.enter_additional_tags("58=Replace refused");
     ui.click("Send");
     let raw = peer.receive(b"9", 3);
     let fields = decoder.decode(&raw).unwrap().fields();
@@ -612,6 +647,7 @@ fn multileg_execution_and_replace_reject_keep_references() {
         (41, b"SPREAD"),
         (434, b"2"),
         (39, b"0"),
+        (58, b"Replace refused"),
     ] {
         assert_eq!(fields.get(tag), Some(value));
     }

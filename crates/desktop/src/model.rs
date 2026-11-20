@@ -1,5 +1,8 @@
+mod additional;
 pub mod execution;
 pub mod grouped;
+
+pub use additional::ADDITIONAL_TAGS_ERROR_PREFIX;
 
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -8,12 +8,13 @@ use fixtester_desktop::model::{
 use fixtester_desktop::store::Entry;
 use fixtester_desktop::transport::Send;
 
-use super::{Dialog, Workspace, field, submit};
+use super::{Dialog, Workspace, additional, field, submit};
 
 pub(in crate::ui) struct ExecutionDraft {
     pub(super) id: i64,
     pub(super) waiting: Option<u64>,
     report: Report,
+    additional: String,
 }
 
 pub(in crate::ui) fn menu(
@@ -102,6 +103,7 @@ impl Workspace {
                     id,
                     waiting: None,
                     report,
+                    additional: String::new(),
                 }));
             }
             Err(error) => self.notice = error.to_string(),
@@ -133,22 +135,9 @@ impl Workspace {
             .show(ui, |ui| {
                 report_fields(ui, &mut draft.report, false);
                 if let Some(value) = draft.report.reference_fill_type() {
-                    ui.horizontal(|ui| {
-                        let label = ui.label("Referenced fill type");
-                        egui::ComboBox::from_id_salt("reference-fill-type")
-                            .selected_text(match value.as_str() {
-                                "1" => "Partial fill",
-                                "2" => "Full fill",
-                                _ => "Select a fill type",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(value, "1".into(), "Partial fill");
-                                ui.selectable_value(value, "2".into(), "Full fill");
-                            })
-                            .response
-                            .labelled_by(label.id);
-                    });
+                    referenced_fill_type(ui, value);
                 }
+                additional::show(ui, &mut draft.additional, &mut self.notice);
                 egui::CollapsingHeader::new("Additional FIX fields").show(ui, |ui| {
                     report_fields(ui, &mut draft.report, true);
                     if !draft.report.carried_groups().is_empty() {
@@ -161,11 +150,13 @@ impl Workspace {
             });
         match submit(ui, "Send") {
             Some(false) => return false,
-            Some(true) => match draft
-                .report
-                .validate()
-                .and_then(|()| self.queue(draft.id, Send::Execution(draft.report.clone())))
-            {
+            Some(true) => match draft.report.validate().and_then(|()| {
+                self.queue(
+                    draft.id,
+                    Send::Execution(draft.report.clone()),
+                    &draft.additional,
+                )
+            }) {
                 Ok(epoch) => {
                     draft.waiting = Some(epoch);
                     self.notice.clear();
@@ -176,6 +167,24 @@ impl Workspace {
         }
         true
     }
+}
+
+fn referenced_fill_type(ui: &mut egui::Ui, value: &mut String) {
+    ui.horizontal(|ui| {
+        let label = ui.label("Referenced fill type");
+        egui::ComboBox::from_id_salt("reference-fill-type")
+            .selected_text(match value.as_str() {
+                "1" => "Partial fill",
+                "2" => "Full fill",
+                _ => "Select a fill type",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(value, "1".into(), "Partial fill");
+                ui.selectable_value(value, "2".into(), "Full fill");
+            })
+            .response
+            .labelled_by(label.id);
+    });
 }
 
 fn report_fields(ui: &mut egui::Ui, report: &mut Report, detail: bool) {

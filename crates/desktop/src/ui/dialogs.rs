@@ -1,3 +1,4 @@
+mod additional;
 pub(super) mod execution;
 mod grouped;
 
@@ -72,6 +73,7 @@ impl From<&SavedProfile> for ProfileDraft {
 pub(super) struct OrderDraft {
     id: i64,
     order: Order,
+    additional: String,
     recalled_symbol: String,
     selected_reference: bool,
     focus: bool,
@@ -113,6 +115,7 @@ impl Workspace {
             recalled_symbol: order.values.symbol.clone(),
             selected_reference,
             order,
+            additional: String::new(),
             focus: true,
             waiting: None,
         }));
@@ -186,7 +189,7 @@ impl Workspace {
                 Dialog::Reset(id) => open = self.reset_dialog(ui, *id),
                 Dialog::Export(path) => open = self.export_dialog(ui, path),
             }
-            if !self.notice.is_empty() {
+            if !self.notice.is_empty() && additional::error(&self.notice).is_none() {
                 ui.label(RichText::new(&self.notice).color(ui.visuals().warn_fg_color));
             }
         });
@@ -251,14 +254,18 @@ impl Workspace {
                     });
             });
         }
+        additional::show(ui, &mut draft.additional, &mut self.notice);
         if let Some(confirm) = submit(ui, "Send") {
             if !confirm {
                 return false;
             }
-            let result = draft
-                .order
-                .validate()
-                .and_then(|()| self.queue(draft.id, Send::Order(draft.order.clone())));
+            let result = draft.order.validate().and_then(|()| {
+                self.queue(
+                    draft.id,
+                    Send::Order(draft.order.clone()),
+                    &draft.additional,
+                )
+            });
             match result {
                 Ok(epoch) => {
                     draft.waiting = Some(epoch);
@@ -347,7 +354,7 @@ impl Workspace {
                 return false;
             }
             let result = Application::tags(draft.version, &draft.kind, &draft.text)
-                .and_then(|message| self.queue(draft.id, Send::Tags(message)));
+                .and_then(|message| self.queue(draft.id, Send::Tags(message), ""));
             match result {
                 Ok(epoch) => {
                     draft.waiting = Some(epoch);
@@ -359,12 +366,13 @@ impl Workspace {
         true
     }
 
-    fn queue(&self, id: i64, message: Send) -> Result<u64> {
+    fn queue(&self, id: i64, message: Send, additional: &str) -> Result<u64> {
         let epoch = self
             .sessions
             .status(id)
             .map_or(0, |status| status.completed);
-        self.sessions.send(id, message)?;
+        self.sessions
+            .send_with_additional_tags(id, message, additional)?;
         Ok(epoch)
     }
 
