@@ -233,6 +233,7 @@ fn workspace_sends_a_multileg_order_and_an_order_list() {
     let mut decoder = Decoder::new(256);
     let fields = decoder.decode(&raw).unwrap().fields();
     assert_eq!(fields.get_u64(555), Some(2));
+    assert_eq!(fields.get(461), Some(b"FXXXXS".as_slice()));
     assert_eq!(fields.get(44), Some(b"-0.25".as_slice()));
     ui.click("Order list");
     ui.enter("Symbol", "ALPHA");

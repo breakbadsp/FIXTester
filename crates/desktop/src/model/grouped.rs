@@ -41,40 +41,47 @@ pub struct Leg {
 }
 
 impl Leg {
-    fn fields(&self) -> Result<Vec<(u32, String)>> {
+    fn fields(&self, version: Version) -> Result<Vec<(u32, String)>> {
         if !wire_text(&self.symbol, 64) {
             return Err(invalid("Enter a leg symbol."));
         }
-        if !matches_type(FieldType::MonthYear, self.maturity.as_bytes()) {
+        let maturity = self.maturity.as_bytes();
+        let maturity_tag = if version == Version::Fix43 {
+            match maturity.len() {
+                6 if matches_type(FieldType::MonthYear, maturity) => 610,
+                8 if matches_type(FieldType::LocalMktDate, maturity) => 611,
+                _ => return Err(invalid("Enter FIX 4.3 leg maturity as YYYYMM or YYYYMMDD.")),
+            }
+        } else if matches_type(FieldType::MonthYear, maturity) {
+            610
+        } else {
             return Err(invalid(
                 "Enter leg maturity as YYYYMM, YYYYMMDD, or YYYYMMwN.",
             ));
-        }
+        };
         if !positive_decimal(&self.ratio) {
             return Err(invalid("Enter a positive leg ratio."));
         }
         let mut fields = vec![
             (600, self.symbol.clone()),
-            (610, self.maturity.clone()),
+            (maturity_tag, self.maturity.clone()),
             (623, self.ratio.clone()),
             (624, self.side.wire().into()),
         ];
-        if self.contract == Contract::Future {
-            fields.push((609, "FUT".into()));
-        } else {
+        let (cfi, security_type) = match self.contract {
+            Contract::Future => ("FXXXXX", "FUT"),
+            Contract::Call => ("OCXXXX", "OPT"),
+            Contract::Put => ("OPXXXX", "OPT"),
+        };
+        fields.push((608, cfi.into()));
+        if version == Version::Fix44 {
+            fields.push((609, security_type.into()));
+        }
+        if self.contract != Contract::Future {
             if !positive_decimal(&self.strike) {
                 return Err(invalid("Enter a positive option strike."));
             }
-            let cfi = if self.contract == Contract::Call {
-                "OCXXXX"
-            } else {
-                "OPXXXX"
-            };
-            fields.extend([
-                (608, cfi.into()),
-                (609, "OPT".into()),
-                (612, self.strike.clone()),
-            ]);
+            fields.push((612, self.strike.clone()));
         }
         Ok(fields)
     }
@@ -82,34 +89,17 @@ impl Leg {
 
 #[derive(Debug, Clone)]
 pub enum GroupedOrder {
-    Multileg {
-        symbol: String,
-        quantity: String,
-        price: String,
-        legs: Vec<Leg>,
-    },
-    List {
-        bid_type: BidType,
-        orders: Vec<OrderValues>,
-    },
+    Multileg(MultilegOrder),
+    List(Vec<OrderValues>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BidType {
-    #[default]
-    None,
-    NonDisclosed,
-    Disclosed,
-}
-
-impl BidType {
-    fn wire(self) -> &'static str {
-        match self {
-            Self::None => "3",
-            Self::NonDisclosed => "1",
-            Self::Disclosed => "2",
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct MultilegOrder {
+    pub symbol: String,
+    pub quantity: String,
+    pub price: String,
+    pub cfi: String,
+    pub legs: Vec<Leg>,
 }
 
 impl GroupedOrder {
@@ -122,63 +112,71 @@ impl GroupedOrder {
         let mut timestamp = [0; 21];
         let time = String::from_utf8_lossy(write_utc_timestamp(time, &mut timestamp));
         match self {
-            Self::Multileg {
-                symbol,
-                quantity,
-                price,
-                legs,
-            } => multileg(version, id, &time, symbol, quantity, price, legs),
-            Self::List { bid_type, orders } => order_list(version, &id, &time, *bid_type, orders),
+            Self::Multileg(order) => order.application(version, id, &time),
+            Self::List(orders) => order_list(version, &id, &time, orders),
         }
     }
 }
 
-fn multileg(
-    version: Version,
-    id: String,
-    time: &str,
-    symbol: &str,
-    quantity: &str,
-    price: &str,
-    legs: &[Leg],
-) -> Result<Application> {
-    let group = group(version, "AB", 555)?;
-    if !(2..=GROUP_ROWS_MAX).contains(&legs.len()) {
-        return Err(invalid("Enter 2 to 16 legs."));
+impl MultilegOrder {
+    fn application(&self, version: Version, id: String, time: &str) -> Result<Application> {
+        let Self {
+            symbol,
+            quantity,
+            price,
+            cfi,
+            legs,
+        } = self;
+        let group = group(version, "AB", 555)?;
+        if !(2..=GROUP_ROWS_MAX).contains(&legs.len()) {
+            return Err(invalid("Enter 2 to 16 legs."));
+        }
+        if !wire_text(symbol, 64) || !positive_decimal(quantity) {
+            return Err(invalid("Enter a strategy symbol and positive quantity."));
+        }
+        if price.len() > 24 || !matches_type(FieldType::Price, price.as_bytes()) {
+            return Err(invalid("Enter a decimal net limit price."));
+        }
+        let cfi = if cfi.is_empty() {
+            if legs.iter().all(|leg| leg.contract == Contract::Future) {
+                "FXXXXS"
+            } else {
+                "OMXXXS"
+            }
+        } else if cfi.len() == 6 && cfi.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            cfi
+        } else {
+            return Err(invalid("Enter a six-letter uppercase strategy CFI code."));
+        };
+        let mut fields = vec![(11, id)];
+        if version == Version::Fix43 {
+            fields.push((21, "1".into()));
+        }
+        fields.extend([
+            (55, symbol.clone()),
+            (167, "MLEG".into()),
+            (461, cfi.into()),
+            (54, "B".into()),
+            (60, time.into()),
+            (38, quantity.clone()),
+            (40, "2".into()),
+            (44, price.clone()),
+            (555, legs.len().to_string()),
+        ]);
+        for (index, leg) in legs.iter().enumerate() {
+            let values = leg
+                .fields(version)
+                .map_err(|error| invalid(format!("Leg {}. {error}", index + 1)))?;
+            append_entry(group, &mut fields, values)?;
+        }
+        Application::new(version, "AB", fields)
     }
-    if !wire_text(symbol, 64) || !positive_decimal(quantity) {
-        return Err(invalid("Enter a strategy symbol and positive quantity."));
-    }
-    if price.len() > 24 || !matches_type(FieldType::Price, price.as_bytes()) {
-        return Err(invalid("Enter a decimal net limit price."));
-    }
-    let mut fields = vec![(11, id)];
-    if version == Version::Fix43 {
-        fields.push((21, "1".into()));
-    }
-    fields.extend([
-        (55, symbol.into()),
-        (54, "B".into()),
-        (60, time.into()),
-        (38, quantity.into()),
-        (40, "2".into()),
-        (44, price.into()),
-        (555, legs.len().to_string()),
-    ]);
-    for (index, leg) in legs.iter().enumerate() {
-        let values = leg
-            .fields()
-            .map_err(|error| invalid(format!("Leg {}. {error}", index + 1)))?;
-        append_entry(group, &mut fields, values)?;
-    }
-    Application::new(version, "AB", fields)
 }
 
 fn order_list(
     version: Version,
     id: &str,
     time: &str,
-    bid_type: BidType,
     orders: &[OrderValues],
 ) -> Result<Application> {
     let group = group(version, "E", 73)?;
@@ -188,7 +186,7 @@ fn order_list(
     let count = orders.len().to_string();
     let mut fields = vec![
         (66, id.into()),
-        (394, bid_type.wire().into()),
+        (394, "3".into()),
         (68, count.clone()),
         (73, count),
     ];

@@ -2,7 +2,7 @@ use eframe::egui;
 use fix_dict::Version;
 use fixtester_desktop::model::OrderValues;
 use fixtester_desktop::model::grouped::{
-    BidType, Contract, GROUP_ROWS_MAX, GroupedOrder, Leg, Side,
+    Contract, GROUP_ROWS_MAX, GroupedOrder, Leg, MultilegOrder, Side,
 };
 use fixtester_desktop::transport::Send;
 
@@ -12,6 +12,7 @@ pub(in crate::ui) struct GroupedDraft {
     pub(super) id: i64,
     pub(super) waiting: Option<u64>,
     order: GroupedOrder,
+    version: Version,
 }
 
 impl Workspace {
@@ -23,53 +24,56 @@ impl Workspace {
             if saved.profile.version == Version::Fix42 {
                 return;
             }
-            GroupedOrder::Multileg {
+            GroupedOrder::Multileg(MultilegOrder {
                 symbol: String::new(),
                 quantity: String::new(),
                 price: String::new(),
                 legs: vec![new_leg(Side::Buy), new_leg(Side::Sell)],
-            }
+                cfi: String::new(),
+            })
         } else {
-            GroupedOrder::List {
-                bid_type: BidType::default(),
-                orders: vec![OrderValues::default()],
-            }
+            GroupedOrder::List(vec![OrderValues::default()])
         };
         self.dialog = Some(Dialog::Grouped(GroupedDraft {
             id: saved.id,
             waiting: None,
             order,
+            version: saved.profile.version,
         }));
         self.notice.clear();
     }
 
     pub(super) fn grouped_dialog(&mut self, ui: &mut egui::Ui, draft: &mut GroupedDraft) -> bool {
         match &mut draft.order {
-            GroupedOrder::Multileg {
+            GroupedOrder::Multileg(MultilegOrder {
                 symbol,
                 quantity,
                 price,
                 legs,
-            } => {
+                cfi,
+            }) => {
                 ui.heading("New multileg limit order");
                 ui.label("35=AB · The Buy or Sell direction comes from each leg.");
                 egui::Grid::new("strategy").show(ui, |ui| {
                     field(ui, "Strategy symbol", symbol, 64);
                     field(ui, "Strategy quantity", quantity, 24);
                     field(ui, "Net limit price", price, 24);
+                    field(ui, "Strategy CFI override", cfi, 6);
                 });
-                entries(ui, legs, 2, "leg", leg_fields, || new_leg(Side::Buy));
+                entries(
+                    ui,
+                    legs,
+                    2,
+                    "leg",
+                    |ui, leg, number| {
+                        leg_fields(ui, leg, number, draft.version);
+                    },
+                    || new_leg(Side::Buy),
+                );
             }
-            GroupedOrder::List { bid_type, orders } => {
+            GroupedOrder::List(orders) => {
                 ui.heading("New list of limit orders");
-                ui.label("35=E · FIXTester assigns the list and order IDs.");
-                egui::ComboBox::from_label("Bid type (394)")
-                    .selected_text(bid_label(*bid_type))
-                    .show_ui(ui, |ui| {
-                        for kind in [BidType::None, BidType::NonDisclosed, BidType::Disclosed] {
-                            ui.selectable_value(bid_type, kind, bid_label(kind));
-                        }
-                    });
+                ui.label("35=E · No bidding process");
                 entries(ui, orders, 1, "order", list_fields, OrderValues::default);
             }
         }
@@ -145,7 +149,7 @@ fn new_leg(side: Side) -> Leg {
     }
 }
 
-fn leg_fields(ui: &mut egui::Ui, leg: &mut Leg, number: usize) {
+fn leg_fields(ui: &mut egui::Ui, leg: &mut Leg, number: usize, version: Version) {
     ui.label("Contract");
     ui.horizontal(|ui| {
         ui.selectable_value(&mut leg.contract, Contract::Future, "Future");
@@ -154,8 +158,13 @@ fn leg_fields(ui: &mut egui::Ui, leg: &mut Leg, number: usize) {
     });
     ui.end_row();
     field(ui, &format!("Leg {number} symbol"), &mut leg.symbol, 64);
-    field(ui, &format!("Leg {number} maturity"), &mut leg.maturity, 8)
-        .on_hover_text("YYYYMM, YYYYMMDD, or YYYYMMwN");
+    field(ui, &format!("Leg {number} maturity"), &mut leg.maturity, 8).on_hover_text(
+        if version == Version::Fix43 {
+            "YYYYMM or YYYYMMDD"
+        } else {
+            "YYYYMM, YYYYMMDD, or YYYYMMwN"
+        },
+    );
     if leg.contract != Contract::Future {
         field(ui, "Strike", &mut leg.strike, 24);
     }
@@ -181,12 +190,4 @@ fn list_fields(ui: &mut egui::Ui, order: &mut OrderValues, _number: usize) {
     ui.end_row();
     field(ui, "Quantity", &mut order.quantity, 24);
     field(ui, "Limit price", &mut order.price, 24);
-}
-
-fn bid_label(kind: BidType) -> &'static str {
-    match kind {
-        BidType::None => "No bidding process",
-        BidType::NonDisclosed => "Non-disclosed",
-        BidType::Disclosed => "Disclosed",
-    }
 }
