@@ -624,3 +624,6 @@ fn grouped_orders_send_versioned_counts_and_entries() {
         }
     }
 }
+
+#[path = "support/automation.rs"]
+mod automation;

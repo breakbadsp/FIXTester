@@ -876,3 +876,117 @@ fn cancel_reject_echoes_the_list_id_on_wire() {
         assert_eq!(fields.get(tag), Some(value));
     }
 }
+
+#[test]
+fn acceptor_automation_from_workspace_handles_guided_order_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+    let acceptor = Profile {
+        name: "Test venue".into(),
+        version: Version::Fix44,
+        role: Role::Acceptor,
+        sender: "VENUE".into(),
+        target: "TRADER".into(),
+        address,
+        heartbeat: 30,
+    };
+    let initiator = Profile {
+        name: "Test trader".into(),
+        role: Role::Initiator,
+        sender: acceptor.target.clone(),
+        target: acceptor.sender.clone(),
+        ..acceptor.clone()
+    };
+    let acceptor_db = dir.path().join("acceptor.db");
+    let mut venue = workspace_with_profile(&acceptor_db, &acceptor);
+    let mut trader = workspace_with_profile(&dir.path().join("initiator.db"), &initiator);
+    venue.click("Automation off");
+    choose_rule(&mut venue, "New", "Acknowledge");
+    choose_rule(&mut venue, "Replace", "Partial fill");
+    venue.wait_for(accesskit::Role::Label, "Accept replace, then fill.");
+    venue.enter("Replace partial quantity", "3");
+    choose_rule(&mut venue, "Cancel", "Full fill");
+    venue.wait_for(accesskit::Role::Label, "Fill before cancel");
+    let enable = venue.wait_for(accesskit::Role::CheckBox, "Enable automation");
+    venue.action(enable, accesskit::Action::Click);
+    venue.click("Done");
+    venue.wait_for_workspace();
+    venue.wait_for(accesskit::Role::Button, "Automation on");
+    venue.key(Key::F5, Modifiers::NONE);
+    venue.wait_for(accesskit::Role::Label, "Listening");
+    trader.key(Key::F5, Modifiers::NONE);
+    trader.wait_for(accesskit::Role::Label, "Logon complete.");
+
+    send_guided_chain(&mut trader);
+    assert_automated_chain(&mut trader);
+
+    venue.key(Key::F5, Modifiers::NONE);
+    venue.wait_for(accesskit::Role::Button, "Automation off");
+    drop(venue);
+    Driver::new(&acceptor_db).wait_for(accesskit::Role::Button, "Automation off");
+}
+
+fn workspace_with_profile(path: &Path, profile: &Profile) -> Driver {
+    let mut store = fixtester_desktop::store::Store::open(path).unwrap();
+    store.save_profile(None, profile).unwrap();
+    drop(store);
+    Driver::new(path)
+}
+
+fn choose_rule(ui: &mut Driver, request: &str, response: &str) {
+    let combo = ui.wait_for(accesskit::Role::ComboBox, request);
+    ui.action(combo, accesskit::Action::Click);
+    ui.click(response);
+}
+
+fn send_guided_chain(trader: &mut Driver) {
+    trader.key(Key::N, Modifiers::CTRL);
+    trader.enter("Symbol", "WIDGET");
+    trader.enter("Quantity", "10");
+    trader.enter("Limit price", "12.50");
+    trader.click("Send");
+    trader.wait_for_workspace();
+
+    trader.click("NewOrderSingle");
+    trader.key(Key::R, Modifiers::CTRL);
+    trader.enter("Limit price", "13.50");
+    trader.click("Send");
+    trader.wait_for_workspace();
+
+    trader.click("OrderCancelReplaceRequest");
+    trader.key(Key::K, Modifiers::CTRL);
+    trader.click("Send");
+    trader.wait_for_workspace();
+}
+
+fn assert_automated_chain(trader: &mut Driver) {
+    use fixtester_desktop::store::{Direction, Filter};
+
+    trader.wait_for(accesskit::Role::Button, "OrderCancelReject");
+    let id = trader.workspace.selected.unwrap();
+    let mut rows = trader
+        .workspace
+        .store
+        .history(id, &Filter::default(), None)
+        .unwrap();
+    rows.retain(|row| {
+        row.direction == Direction::Received && matches!(row.kind.as_str(), "8" | "9")
+    });
+    rows.reverse();
+    assert_eq!(rows.len(), 5);
+    let mut decoder = Decoder::new(256);
+    for (row, expected) in rows.iter().zip([
+        &[(150, "0"), (39, "0"), (151, "10")][..],
+        &[(150, "5"), (39, "0"), (44, "13.50")],
+        &[(150, "F"), (39, "1"), (32, "3"), (151, "7")],
+        &[(150, "F"), (39, "2"), (32, "7"), (151, "0")],
+        &[(434, "1"), (39, "2"), (102, "0")],
+    ]) {
+        let fields = decoder.decode(&row.raw).unwrap().fields();
+        for &(tag, value) in expected {
+            assert_eq!(fields.get(tag), Some(value.as_bytes()), "tag {tag}");
+        }
+    }
+}

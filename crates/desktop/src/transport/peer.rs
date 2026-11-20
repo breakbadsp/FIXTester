@@ -3,10 +3,14 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use fix_codec::{Decoder, Message, UtcMillis, frame, frame_with_checksum, tag};
-use fix_session::{Config, Event, Role, Session, SessionTime, State};
+use fix_session::{Config, Disposition, Event, Role, Session, SessionTime, State};
 
 use super::{Control, POLL, Phase, Send, SendRequest};
-use crate::model::{FIELDS_MAX, MESSAGE_MAX, OrderKind, OrderValues, now};
+use crate::model::{
+    Application, FIELDS_MAX, MESSAGE_MAX, OrderKind, OrderValues,
+    execution::automation::{Automation, Plan, SKIPPED},
+    now,
+};
 use crate::store::{Checkpoint, Direction, Packet, SavedProfile, Store, Transition};
 use crate::{Error, Result, invalid};
 
@@ -27,6 +31,7 @@ struct Peer<'a> {
     store: &'a mut Store,
     saved: &'a SavedProfile,
     control: &'a Control,
+    automation: Option<Automation<'a>>,
 }
 
 pub(super) fn connect(
@@ -63,6 +68,7 @@ pub(super) fn connect(
         store,
         saved,
         control,
+        automation: control.rules.as_ref().map(Automation::new),
     };
     control.update(|status| status.notice.clear());
     let time = peer.time();
@@ -194,11 +200,75 @@ impl Peer<'_> {
             self.commit(time.utc, Some((raw, "Rejected input")), None)?;
             return Err(error);
         }
-        self.session.on_message_at(time, &message);
+        let reset_mode_target = (message.msg_type() == tag::msg_type::SEQUENCE_RESET
+            && message.fields().get_bool(tag::GAP_FILL_FLAG) == Some(false))
+        .then(|| self.session.sequence_numbers().next_target);
+        let disposition = self.session.on_message_at(time, &message);
         if self.session.state() == State::Active {
             self.reset_armed = false;
         }
-        self.commit(time.utc, Some((raw, "Received")), None)
+        let plan = match &mut self.automation {
+            Some(automation)
+                if disposition == Disposition::Deliver
+                    && self.session.state() == State::Active
+                    && !self.control.stopping() =>
+            {
+                automation.plan(self.saved.profile.version, &message, || {
+                    self.store.next_order_id(time.utc)
+                })
+            }
+            _ => Ok(None),
+        };
+        let note = match &plan {
+            Err(Error::Invalid(reason)) => format!("{SKIPPED}{reason}"),
+            _ => "Received".into(),
+        };
+        self.commit_transition(time.utc, Some((raw, &note)), None, reset_mode_target)?;
+        match plan {
+            Ok(Some(plan)) => self.send_automatic(time, plan),
+            Err(Error::Invalid(_)) => {
+                self.control.update(|status| status.notice = note);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn send_automatic(&mut self, time: SessionTime, mut plan: Plan) -> Result<()> {
+        // Build the complete response before writing any frame. A write failure
+        // ends the connection and drops all simulated order state.
+        let applications = std::mem::take(&mut plan.reports)
+            .into_iter()
+            .map(|report| {
+                self.prepare(Send::Execution(report), time.utc)
+                    .map(|(message, _)| message)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if self.control.stopping() {
+            return Ok(());
+        }
+        for application in applications {
+            self.queue_application(time, &application)?;
+            self.commit(time.utc, None, None)?;
+        }
+        if let Some(automation) = &mut self.automation {
+            automation.apply(plan);
+        }
+        self.control
+            .update(|status| status.notice = "Automation sent a response.".into());
+        Ok(())
+    }
+
+    fn queue_application(&mut self, time: SessionTime, application: &Application) -> Result<()> {
+        self.session
+            .send_app_at(time, application.kind.as_bytes(), |body| {
+                for (tag, value) in &application.fields {
+                    body.field(*tag, value.as_bytes());
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| invalid(format!("Cannot send application message: {error:?}")))
     }
 
     fn send(&mut self, command: SendRequest) -> Result<()> {
@@ -207,19 +277,20 @@ impl Peer<'_> {
             .prepare(command.message, time.utc)
             .and_then(|(application, values)| {
                 let application = application.with_additional_tags(&command.additional)?;
-                self.session
-                    .send_app_at(time, application.kind.as_bytes(), |body| {
-                        for (tag, value) in &application.fields {
-                            body.field(*tag, value.as_bytes());
-                        }
-                    })
-                    .map_err(|error| {
-                        invalid(format!("Cannot send application message: {error:?}"))
-                    })?;
-                Ok(values)
+                self.queue_application(time, &application)?;
+                Ok((application, values))
             });
         let result = match result {
-            Ok(values) => self.commit(time.utc, None, values.as_ref()),
+            Ok((application, values)) => {
+                let result = self.commit(time.utc, None, values.as_ref());
+                if result.is_ok()
+                    && application.kind == "8"
+                    && let Some(automation) = &mut self.automation
+                {
+                    automation.clear_live();
+                }
+                result
+            }
             Err(error @ Error::Database(_)) => return Err(error),
             Err(error) => {
                 self.complete_command(Some(error.to_string()));
@@ -284,6 +355,16 @@ impl Peer<'_> {
         received: Option<(&[u8], &str)>,
         values: Option<&OrderValues>,
     ) -> Result<()> {
+        self.commit_transition(time, received, values, None)
+    }
+
+    fn commit_transition(
+        &mut self,
+        time: UtcMillis,
+        received: Option<(&[u8], &str)>,
+        values: Option<&OrderValues>,
+        reset_mode_target: Option<u64>,
+    ) -> Result<()> {
         self.output.clear();
         self.session.take_output(&mut self.output);
         let seq = self.session.sequence_numbers();
@@ -319,11 +400,18 @@ impl Peer<'_> {
             });
             result?;
         }
-        let note = self
-            .session
-            .take_events()
-            .filter_map(event_note)
-            .next_back();
+        let mut note = None;
+        for event in self.session.take_events() {
+            if let Event::SequenceReset { new_seq } = event
+                && reset_mode_target.is_some_and(|previous| new_seq > previous)
+                && let Some(automation) = &mut self.automation
+            {
+                automation.clear_live();
+            }
+            if let Some(event_note) = event_note(event) {
+                note = Some(event_note);
+            }
+        }
         self.control.update(|status| {
             status.phase = Phase::Link(self.session.state());
             status.seq = seq;

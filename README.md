@@ -1,6 +1,6 @@
 # FIXTester
 
-FIXTester is a native application for manual FIX testing on x86-64 Linux.
+FIXTester is a native application for FIX testing on x86-64 Linux.
 It uses FIX 4.2, 4.3, and 4.4 over plain TCP. It sends orders and displays
 the messages that the peer returns. It keeps session state and message
 history locally with bundled SQLite.
@@ -42,6 +42,47 @@ reset. A reset keeps the old message history.
 
 Use a test peer on a trusted network. The application does not require
 a FIXSim process, a database server, or an Internet connection.
+
+## Automate acceptor responses
+
+Select an acceptor profile and open **Automation off**. Choose a rule for
+**New**, **Replace**, and **Cancel**. Select **Enable automation**, close
+the dialog, then select **Listen**. Each row starts in **Manual**.
+Select **Stop** to disable automation or change its rules. Settings
+apply to that profile and stay in memory until you exit FIXTester.
+
+| Rule | New | Replace | Cancel |
+|---|---|---|---|
+| Manual | Use the timeline actions. | Use the timeline actions. | Use the timeline actions. |
+| Acknowledge | Accept the order. | Accept the new terms and keep earlier fills. | Cancel the remaining quantity. |
+| Reject | Send an Execution Report with Rejected status. | Send an Order Cancel Reject. | Send an Order Cancel Reject. |
+| Partial fill | Accept and fill part of the order. | Accept the replacement, then fill part of it. | Fill part of the active order, then cancel the remainder. |
+| Full fill | Accept and fill the order. | Accept the replacement, then fill the remainder. | Fill the active order, then reject the cancel as too late. |
+
+Enter an exact partial quantity that is smaller than the remaining
+quantity. Prices and quantities support six decimal places. Leave the
+fill price override blank to use the active limit price. A Market order
+requires an override for a fill. Replace and Cancel use OrigClOrdID to
+find the current order and check OrderID if the request includes it.
+If an accepted replacement asks for less than CumQty, the report sets
+OrderQty to CumQty and closes the order without an additional trade.
+
+Automation handles single-order `D`, `G`, and `F` requests for Day and
+GTC Limit or Market orders. Use the manual actions for order lists,
+multileg orders, and other messages. If a rule cannot run, the timeline
+shows **Automation skipped** with the reason. Examples include unknown
+references, MinQty (110), unsupported terms, and partial quantities too
+large to use.
+An unseen request marked PossDup or PossResend also goes to manual handling.
+
+An acceptor tracks up to 256 live automated orders and remembers up to
+4,096 request IDs per TCP connection. The live order state clears on
+disconnect, Stop, or a sequence reset that advances the peer's expected
+number. A listener that stays active uses the same rules on reconnect.
+A replace or cancel left to Manual removes its referenced chain from
+automation. Sending a manual Execution Report clears all automated
+chains for that connection. Use manual actions to finish a chain after
+this occurs.
 
 ## Send and inspect orders
 

@@ -19,7 +19,12 @@ pub enum Source {
 impl Source {
     pub fn identify(version: Version, entry: &Entry) -> Option<Self> {
         version.dictionary().message(&entry.kind)?;
-        match (entry.direction, entry.status.as_str(), entry.kind.as_str()) {
+        let status = if entry.status.starts_with(super::automation::SKIPPED) {
+            "Received"
+        } else {
+            entry.status.as_str()
+        };
+        match (entry.direction, status, entry.kind.as_str()) {
             (Direction::Received, "Received", "D" | "AB") => Some(Self::New),
             (Direction::Received, "Received", "E") => Some(Self::List),
             (Direction::Received, "Received", "F") => Some(Self::Cancel),
@@ -69,7 +74,7 @@ pub struct Context {
     pub(super) list_id: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct OrderContext {
     pub(super) fields: Vec<(u32, String)>,
     pub(super) groups: Vec<(u32, String)>,
@@ -194,7 +199,7 @@ impl Context {
     }
 }
 
-fn read_order(
+pub(super) fn read_order(
     version: Version,
     fields: Fields<'_>,
     source: &Section,
