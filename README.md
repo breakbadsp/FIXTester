@@ -7,6 +7,11 @@ history locally with bundled SQLite.
 
 ## Start a session
 
+In the extracted Linux package, run `./start.sh` to launch FIXTester in
+the background. The launcher prints the process ID and log path. Each
+launch writes stdout and stderr to `logs/fixtester-<UTC timestamp>-<PID>.log`
+beside the executable. Run `./fixtester` to keep it in the foreground.
+
 1. Run `fixtester`. Select **Add profile**.
 2. Enter the local SenderCompID, the peer TargetCompID, the FIX version,
    and a numeric TCP address and port. Use brackets around IPv6 addresses.
