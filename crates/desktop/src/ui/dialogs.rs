@@ -1,3 +1,5 @@
+mod grouped;
+
 use std::path::PathBuf;
 use std::sync::mpsc::sync_channel;
 
@@ -18,6 +20,7 @@ pub(super) enum Dialog {
     Profile(ProfileDraft),
     Order(OrderDraft),
     Tags(TagDraft),
+    Grouped(grouped::GroupedDraft),
     Reset(i64),
     Export(String),
 }
@@ -160,6 +163,7 @@ impl Workspace {
         let pending = match &dialog {
             Dialog::Order(draft) => draft.waiting.is_some(),
             Dialog::Tags(draft) => draft.waiting.is_some(),
+            Dialog::Grouped(draft) => draft.waiting.is_some(),
             _ => false,
         };
         let mut open = true;
@@ -173,6 +177,7 @@ impl Workspace {
             match &mut dialog {
                 Dialog::Order(draft) => open = self.order_dialog(ui, draft),
                 Dialog::Tags(draft) => open = self.tags_dialog(ui, draft),
+                Dialog::Grouped(draft) => open = self.grouped_dialog(ui, draft),
                 Dialog::Profile(draft) => open = self.profile_dialog(ui, draft),
                 Dialog::Reset(id) => open = self.reset_dialog(ui, *id),
                 Dialog::Export(path) => open = self.export_dialog(ui, path),
@@ -194,6 +199,7 @@ impl Workspace {
         let (id, waiting) = match dialog {
             Dialog::Order(draft) => (draft.id, &mut draft.waiting),
             Dialog::Tags(draft) => (draft.id, &mut draft.waiting),
+            Dialog::Grouped(draft) => (draft.id, &mut draft.waiting),
             _ => return false,
         };
         let (Some(previous), Some(status)) = (*waiting, self.sessions.status(id)) else {

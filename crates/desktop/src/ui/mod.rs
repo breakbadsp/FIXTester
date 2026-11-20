@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers, RichText, TextStyle};
+use fix_dict::Version;
 use fix_session::{Role, State};
 use fixtester_desktop::Result;
 use fixtester_desktop::model::{OrderKind, SESSIONS_MAX};
@@ -352,6 +353,22 @@ impl Workspace {
                 {
                     self.open_order(kind, true);
                 }
+            }
+            let multileg = self
+                .selected()
+                .is_some_and(|saved| saved.profile.version != Version::Fix42);
+            if ui
+                .add_enabled(active && multileg, egui::Button::new("Multileg order"))
+                .on_disabled_hover_text("Multileg orders require FIX 4.3 or 4.4.")
+                .clicked()
+            {
+                self.open_grouped(true);
+            }
+            if ui
+                .add_enabled(active, egui::Button::new("Order list"))
+                .clicked()
+            {
+                self.open_grouped(false);
             }
             if ui
                 .add_enabled(active, egui::Button::new("Tag editor"))

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fix_session::{Role, SequenceNumbers, State};
 
-use crate::model::{Application, Order, SESSIONS_MAX};
+use crate::model::{Application, Order, SESSIONS_MAX, grouped::GroupedOrder};
 use crate::store::{SavedProfile, Store};
 use crate::{Result, invalid};
 
@@ -66,6 +66,7 @@ impl Default for Status {
 pub enum Send {
     Tags(Application),
     Order(Order),
+    GroupedOrder(GroupedOrder),
 }
 
 #[derive(Debug)]
