@@ -103,8 +103,9 @@ with the selected fields. Review or edit them before you select **Send**.
   status report.
 - To correct or bust a trade, select a sent fill or correction to copy
   its ExecID into ExecRefID. You can also enter ExecRefID from a received
-  new order or list child. Enter the resulting order totals. For FIX 4.2,
-  select the referenced fill type when you enter ExecRefID manually.
+  new order or list child. Enter the resulting order totals. For a FIX 4.2 trade
+  bust, select the referenced fill type when you enter ExecRefID manually.
+  A FIX 4.2 trade correction uses the corrected order totals.
 
 FIXTester proposes an editable OrderID from the new order's timeline
 record. It proposes a different ID for each list child. On later

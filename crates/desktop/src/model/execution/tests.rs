@@ -34,10 +34,15 @@ fn received(version: Version, kind: &str, body: &[(u32, &str)]) -> Context {
 }
 
 fn fill_inputs(report: &mut Report) {
+    let report_action = report.action;
+    let full_fill = report.action == Action::FullFill;
+    let order_qty = report.value(38).to_owned();
     for field in report.fields_mut() {
         if field.required && field.value.is_empty() {
             field.value = match field.tag {
                 6 | 31 => "10.25",
+                14 if full_fill => &order_qty,
+                14 if report_action == Action::FullFill => "5",
                 14 | 32 => "2",
                 151 => "3",
                 19 => "TRADE-1",
@@ -78,7 +83,7 @@ fn all_execution_actions_use_standard_version_codes() {
         (Calculated, "D", "0", "B", "B", "B"),
         (Restate, "D", "0", "D", "D", "1"),
         (Status, "H", "3", "1", "I", "1"),
-        (Correct, "D", "2", "2", "G", "1"),
+        (Correct, "D", "2", "1", "G", "1"),
         (Bust, "D", "1", "2", "H", "1"),
     ];
     for version in [Version::Fix42, Version::Fix43, Version::Fix44] {
@@ -181,7 +186,12 @@ fn request_rejections_keep_chain_and_reject_the_request() {
             let context = received(
                 version,
                 kind,
-                &[(11, "REQUEST"), (41, "WORKING"), (37, "OID-3")],
+                &[
+                    (11, "REQUEST"),
+                    (41, "WORKING"),
+                    (37, "OID-3"),
+                    (66, "LIST-7"),
+                ],
             );
             assert!(Report::draft(&context, None, Action::Reject).is_err());
             let mut report = Report::draft(&context, None, action).unwrap();
@@ -201,9 +211,20 @@ fn request_rejections_keep_chain_and_reject_the_request() {
                 (41, "WORKING"),
                 (39, "1"),
                 (434, code),
+                (66, "LIST-3"),
             ] {
                 assert_eq!(find(tag), Some(value));
             }
+            assert_eq!(
+                find(66),
+                version
+                    .dictionary()
+                    .message("9")
+                    .unwrap()
+                    .body
+                    .contains(66)
+                    .then_some("LIST-7")
+            );
             for tag in [17, 20, 150] {
                 assert_eq!(find(tag), None);
             }
@@ -247,4 +268,129 @@ fn fills_and_status_require_explicit_context_when_the_order_has_no_state() {
     let report = Report::draft(&status, None, Action::Status).unwrap();
     assert_eq!(report.value(37), "");
     assert!(Report::draft(&status, None, Action::Cancel).is_err());
+}
+
+#[test]
+fn full_fill_requires_exact_cumulative_quantity() {
+    let source = received(
+        Version::Fix44,
+        "D",
+        &[(11, "COID"), (54, "1"), (55, "XYZ"), (38, "5.00")],
+    );
+    let mut draft = Report::draft(&source, None, Action::FullFill).unwrap();
+    fill_inputs(&mut draft);
+    let qty = draft
+        .fields_mut()
+        .iter_mut()
+        .find(|field| field.tag == 14)
+        .unwrap();
+    qty.value = "2".into();
+    assert!(draft.application(UtcMillis(0), "EX".into()).is_err());
+    draft
+        .fields_mut()
+        .iter_mut()
+        .find(|field| field.tag == 14)
+        .unwrap()
+        .value = "05.000".into();
+    assert!(draft.application(UtcMillis(0), "EX".into()).is_ok());
+}
+
+#[test]
+fn gtd_reports_copy_expiry_and_require_one() {
+    let base = [(11, "COID"), (54, "1"), (55, "XYZ"), (38, "5"), (59, "6")];
+    for (tag, expiry) in [(432, "20271217"), (126, "20271217-00:00:00")] {
+        let fields = [base.as_slice(), &[(tag, expiry)]].concat();
+        let source = received(Version::Fix44, "D", &fields);
+        let mut draft = Report::draft(&source, None, Action::Acknowledge).unwrap();
+        let report = draft.application(UtcMillis(0), "EX".into()).unwrap();
+        assert!(
+            report
+                .fields
+                .iter()
+                .any(|(number, value)| *number == tag && value == expiry)
+        );
+        draft
+            .fields_mut()
+            .iter_mut()
+            .find(|field| field.tag == tag)
+            .unwrap()
+            .value
+            .clear();
+        assert!(draft.application(UtcMillis(0), "EX".into()).is_err());
+    }
+}
+
+fn set_field(report: &mut Report, tag: u32, value: &str) {
+    value.clone_into(
+        &mut report
+            .fields_mut()
+            .iter_mut()
+            .find(|field| field.tag == tag)
+            .unwrap()
+            .value,
+    );
+}
+
+#[test]
+fn full_fill_checks_decimal_totals_exactly() {
+    let context = received(
+        Version::Fix44,
+        "D",
+        &[
+            (11, "FULL"),
+            (54, "1"),
+            (55, "XYZ"),
+            (38, "9007199254740993.000"),
+        ],
+    );
+    let mut report = Report::draft(&context, None, Action::FullFill).unwrap();
+    fill_inputs(&mut report);
+    set_field(&mut report, 14, "9007199254740992.999999999");
+    assert!(report.validate().is_err());
+    set_field(&mut report, 14, "09007199254740993.0");
+    assert!(report.validate().is_ok());
+    set_field(&mut report, 151, "0.000000001");
+    assert!(report.validate().is_err());
+}
+
+#[test]
+fn gtd_requires_a_valid_expiry_and_accepts_either_supported_field() {
+    for version in Version::ALL {
+        let context = received(
+            version,
+            "D",
+            &[
+                (11, "GTD"),
+                (54, "1"),
+                (55, "XYZ"),
+                (38, "5"),
+                (59, "6"),
+                (432, "20271231"),
+            ],
+        );
+        let mut report = Report::draft(&context, None, Action::Acknowledge).unwrap();
+        assert_eq!(report.value(432), "20271231");
+        assert!(report.validate().is_ok());
+        set_field(&mut report, 432, "");
+        assert!(report.validate().is_err());
+        set_field(&mut report, 126, "20271231-15:00:00");
+        let app = report.application(UtcMillis(0), "EX-1".into()).unwrap();
+        assert!(app.fields.contains(&(126, "20271231-15:00:00".into())));
+        set_field(&mut report, 126, "20270229-15:00:00");
+        assert!(report.validate().is_err());
+    }
+}
+
+#[test]
+fn cancel_reject_can_take_a_manual_list_id() {
+    let context = received(
+        Version::Fix44,
+        "F",
+        &[(11, "CANCEL"), (41, "CHILD"), (37, "VENUE")],
+    );
+    let mut report = Report::draft(&context, None, Action::RejectCancel).unwrap();
+    fill_inputs(&mut report);
+    set_field(&mut report, 66, "LIST-MANUAL");
+    let app = report.application(UtcMillis(0), String::new()).unwrap();
+    assert!(app.fields.contains(&(66, "LIST-MANUAL".into())));
 }

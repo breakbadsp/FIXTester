@@ -179,10 +179,14 @@ fn workspace_price_only_replace_keeps_selected_instructions() {
 }
 
 fn connected_workspace(path: &Path) -> (Driver, Wire) {
+    connected_workspace_version(path, Version::Fix44)
+}
+
+fn connected_workspace_version(path: &Path, version: Version) -> (Driver, Wire) {
     let addr = TcpListener::bind("127.0.0.1:0").unwrap();
     let profile = Profile {
         name: "Loopback example".into(),
-        version: Version::Fix44,
+        version,
         role: Role::Initiator,
         sender: "TRAINER".into(),
         target: "VENUE".into(),
@@ -191,6 +195,11 @@ fn connected_workspace(path: &Path) -> (Driver, Wire) {
     };
     let mut ui = Driver::new(path);
     ui.click("Add profile");
+    if version != Version::Fix44 {
+        let dropdown = ui.wait_for(accesskit::Role::ComboBox, "FIX.4.4");
+        ui.action(dropdown, accesskit::Action::Click);
+        ui.click(version.begin_string());
+    }
     ui.enter("Name", &profile.name);
     ui.enter("SenderCompID", &profile.sender);
     ui.enter("TargetCompID", &profile.target);
@@ -545,6 +554,8 @@ fn execution_actions_use_the_selected_list_child() {
             (38, b"20"),
             (40, b"2"),
             (44, b"4.25"),
+            (59, b"6"),
+            (126, b"20271120-15:00:00"),
         ],
     );
     ui.click("NewOrderList");
@@ -565,6 +576,8 @@ fn execution_actions_use_the_selected_list_child() {
         (38, b"20"),
         (44, b"4.25"),
         (151, b"20"),
+        (59, b"6"),
+        (126, b"20271120-15:00:00"),
     ] {
         assert_eq!(fields.get(tag), Some(value));
     }
@@ -599,7 +612,9 @@ fn multileg_execution_and_replace_reject_keep_references() {
         (40, b"2"),
         (44, b"-0.25"),
     ];
-    order.extend(legs);
+    order.extend_from_slice(&legs[..8]);
+    order.extend([(618, b"4".as_slice()), (619, b"TEST".as_slice())]);
+    order.extend_from_slice(&legs[8..]);
     peer.send(b"AB", 2, &order);
     ui.click("NewOrderMultileg");
     ui.click("Execution actions");
@@ -616,6 +631,9 @@ fn multileg_execution_and_replace_reject_keep_references() {
     let group = fields.group(definition).unwrap().unwrap();
     let entries = group.entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
+    for tag in [618, 619, 621, 622] {
+        assert_eq!(fields.get(tag), None);
+    }
     assert_eq!(entries[0].iter().collect::<Vec<_>>(), legs[1..10]);
     assert_eq!(entries[1].iter().collect::<Vec<_>>(), legs[10..]);
     ui.wait_for_workspace();
@@ -696,4 +714,83 @@ fn execution_status_echoes_the_status_request_id() {
     }
     assert_eq!(fields.get(20), None);
     assert_eq!(fields.get(31), None);
+}
+
+#[test]
+fn fix42_correction_uses_resulting_fill_type_and_original_exec_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) =
+        connected_workspace_version(&dir.path().join("fix42-correction.db"), Version::Fix42);
+    ui.key(Key::T, Modifiers::CTRL);
+    ui.enter("MsgType", "8");
+    let editor = ui.wait_for(
+        accesskit::Role::MultilineTextInput,
+        "One Tag=Value pair per line.",
+    );
+    ui.action(editor, accesskit::Action::Focus);
+    ui.frame(vec![Event::Paste(
+        "37=VENUE\n11=ORDER\n17=FILL-OLD\n20=0\n150=2\n39=2\n55=XYZ\n54=1\n38=10\n32=9\n31=110\n151=0\n14=10\n6=109".into(),
+    )], Modifiers::NONE);
+    ui.click("Send");
+    peer.receive(b"8", 2);
+    ui.wait_for_workspace();
+
+    ui.click("ExecutionReport");
+    ui.click("Execution actions");
+    ui.click("Trade correction");
+    choose_status(&mut ui, "1 · PartiallyFilled");
+    ui.enter("CumQty", "9");
+    ui.enter("LeavesQty", "1");
+    ui.enter("AvgPx", "100");
+    ui.enter("LastShares", "9");
+    ui.enter("LastPx", "100");
+    ui.click("Send");
+
+    let raw = peer.receive(b"8", 3);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    for (tag, value) in [
+        (20, b"2".as_slice()),
+        (150, b"1"),
+        (39, b"1"),
+        (19, b"FILL-OLD"),
+        (14, b"9"),
+        (151, b"1"),
+    ] {
+        assert_eq!(fields.get(tag), Some(value));
+    }
+}
+
+#[test]
+fn cancel_reject_echoes_the_list_id_on_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("list-reject.db"));
+    peer.send(
+        b"F",
+        2,
+        &[
+            (37, b"VENUE"),
+            (11, b"CANCEL"),
+            (41, b"CHILD"),
+            (66, b"LIST-9"),
+        ],
+    );
+    ui.click("OrderCancelRequest");
+    ui.click("Execution actions");
+    ui.click("Reject cancel request");
+    choose_status(&mut ui, "0 · New");
+    ui.click("Send");
+
+    let raw = peer.receive(b"9", 2);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    for (tag, value) in [
+        (37, b"VENUE".as_slice()),
+        (11, b"CANCEL"),
+        (41, b"CHILD"),
+        (66, b"LIST-9"),
+        (434, b"1"),
+    ] {
+        assert_eq!(fields.get(tag), Some(value));
+    }
 }

@@ -60,6 +60,12 @@ impl Report {
             report.field(41, order.value(41), true, false);
         }
         report.field(39, action.status(context.version), true, false);
+        let list_id = if context.source == Source::List {
+            &context.list_id
+        } else {
+            order.value(66)
+        };
+        report.field(66, list_id, !list_id.is_empty(), true);
         if action.cancel_reject().is_some() {
             report.field(102, "", false, false);
         } else {
@@ -112,14 +118,6 @@ impl Report {
         if matches!(action, Restate | Cancel) {
             self.field(378, "", action == Restate, false);
         }
-        let list_id = if context.source == Source::List {
-            &context.list_id
-        } else {
-            order.value(66)
-        };
-        if !list_id.is_empty() {
-            self.field(66, list_id, true, true);
-        }
         if action == Status && !order.value(790).is_empty() {
             self.field(790, order.value(790), true, true);
         }
@@ -135,13 +133,13 @@ impl Report {
                 self.field(tag, value, false, true);
             }
         }
-        for tag in [1, 15, 40, 44, 59, 99, 152, 468] {
+        for tag in [1, 15, 40, 44, 59, 99, 126, 152, 432, 468] {
             let value = if new_terms || tag == 1 {
                 order.value(tag)
             } else {
                 ""
             };
-            if !value.is_empty() || matches!(tag, 44 | 152 | 468) {
+            if !value.is_empty() || matches!(tag, 44 | 59 | 126 | 152 | 432 | 468) {
                 self.field(tag, value, false, true);
             }
         }
@@ -185,7 +183,7 @@ impl Report {
     }
 
     pub fn reference_fill_type(&mut self) -> Option<&mut String> {
-        (self.version == Version::Fix42 && self.action.references_trade())
+        (self.version == Version::Fix42 && self.action == Action::Bust)
             .then_some(&mut self.reference_type)
     }
 
@@ -236,19 +234,52 @@ impl Report {
         if self.action.has_trade_values() && !nonzero(self.value(32)) {
             return Err(invalid("Enter a positive last quantity (32)."));
         }
-        if self.action == Action::FullFill && nonzero(self.value(151)) {
-            return Err(invalid("A full fill requires zero LeavesQty."));
+        if self.action == Action::FullFill {
+            if nonzero(self.value(151)) {
+                return Err(invalid("A full fill requires zero LeavesQty."));
+            }
+            if !self.value(38).is_empty() && !self.order_filled() {
+                return Err(invalid("A full fill requires CumQty to equal OrderQty."));
+            }
+        }
+        if self.value(59) == "6" && self.value(126).is_empty() && self.value(432).is_empty() {
+            return Err(invalid(
+                "Good Till Date requires ExpireDate (432) or ExpireTime (126).",
+            ));
         }
         if self.action == Action::PartialFill && !nonzero(self.value(151)) {
             return Err(invalid("A partial fill requires positive LeavesQty."));
         }
         if self.version == Version::Fix42
-            && self.action.references_trade()
+            && self.action == Action::Bust
             && !matches!(self.reference_type.as_str(), "1" | "2")
         {
             return Err(invalid("Select the type of the referenced FIX 4.2 fill."));
         }
         Ok(())
+    }
+
+    fn order_filled(&self) -> bool {
+        decimal_parts(self.value(14)) == decimal_parts(self.value(38))
+    }
+
+    fn execution_type(&self) -> Result<String> {
+        let status = self.value(39);
+        if self.version == Version::Fix42 && self.action == Action::Correct {
+            // Appendix D34 uses the fill type after the correction.
+            if !self.value(38).is_empty() {
+                return Ok(if self.order_filled() { "2" } else { "1" }.into());
+            }
+            if matches!(status, "1" | "2") {
+                return Ok(status.into());
+            }
+            return Err(invalid(
+                "Enter OrderQty to determine the corrected fill type.",
+            ));
+        }
+        Ok(self
+            .action
+            .exec_type(self.version, status, &self.reference_type))
     }
 
     pub(crate) fn application(&self, time: UtcMillis, exec_id: String) -> Result<Application> {
@@ -264,10 +295,7 @@ impl Report {
             fields.push((434, response_to.into()));
         } else {
             fields.push((17, exec_id));
-            fields.push((
-                150,
-                action.exec_type(self.version, self.value(39), &self.reference_type),
-            ));
+            fields.push((150, self.execution_type()?));
             if self.version == Version::Fix42 {
                 fields.push((20, action.transaction().into()));
                 if action != Action::Status {
@@ -293,6 +321,14 @@ impl Report {
             _ => None,
         }
     }
+}
+
+fn decimal_parts(value: &str) -> (&str, &str) {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    (
+        whole.trim_start_matches('0'),
+        fraction.trim_end_matches('0'),
+    )
 }
 
 fn nonzero(value: &str) -> bool {

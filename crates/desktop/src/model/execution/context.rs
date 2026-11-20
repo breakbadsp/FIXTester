@@ -249,17 +249,19 @@ fn project_group(
     source: &GroupDef<'_>,
     target: &GroupDef<'_>,
 ) -> Result<Vec<(u32, String)>> {
+    let dict = version.dictionary();
     let mut projected = vec![(target.count_tag, group.len().to_string())];
     for entry in group.entries() {
         let start = projected.len();
         for member in target.members {
             match member {
                 // A prior execution price is not a price for this report.
-                Member::Field(tag) if *tag != 637 => {
+                Member::Field(tag) if *tag != 637
+                    && !dict.data_pairs.iter().any(|(length, data)| tag == length || tag == data) => {
                     if source.members.iter().any(|member| matches!(member, Member::Field(number) if number == tag))
                         && let Some(raw) = entry.get(*tag)
                     {
-                        projected.push(retained(version.dictionary(), *tag, raw)
+                        projected.push(retained(dict, *tag, raw)
                             .ok_or_else(|| invalid(format!("Cannot carry group field {tag}.")))?);
                     }
                 }

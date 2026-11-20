@@ -124,7 +124,7 @@ impl Action {
         match self {
             Restate => "D",
             Replace => "5",
-            Correct | Bust if version == Version::Fix42 => reference_type,
+            Bust if version == Version::Fix42 => reference_type,
             Status if version == Version::Fix42 => status,
             PartialFill | FullFill if version != Version::Fix42 => "F",
             Correct => "G",
