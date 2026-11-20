@@ -25,7 +25,7 @@ toolchain=$(dirname "$(dirname "$(rustup which rustc)")")
 cargo_cache=${CARGO_HOME:-$HOME/.cargo}
 container=${FIXTESTER_CONTAINER:-podman}
 image=localhost/fixtester-smoke-display:8
-mkdir -p "$cargo_cache/registry"
+mkdir -p "$cargo_cache/registry" "$tmp/tests"
 
 "$container" build -t localhost/fixtester-smoke-build:8 -f - "$tmp" <<'DOCKERFILE'
 FROM docker.io/library/almalinux:8
@@ -34,7 +34,7 @@ DOCKERFILE
 
 "$container" run --rm --network=host \
     -v "$PWD:/src:ro" -v "$toolchain:/rust:ro" -v "$cargo_cache/registry:/cargo/registry" \
-    -v "$tmp:/output" -w /src -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/output \
+    -v "$tmp:/output" -w /src -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/output -e TMPDIR=/output/tests \
     -e PATH=/rust/bin:/usr/bin:/bin localhost/fixtester-smoke-build:8 \
     bash -ec 'cargo build --locked --release -p fixtester-desktop --bin fixtester
         cargo test --locked --release -p fixtester-desktop'
@@ -54,7 +54,7 @@ FROM docker.io/library/almalinux:8
 RUN dnf -y install xorg-x11-server-Xvfb mesa-libEGL mesa-libGL mesa-dri-drivers libxkbcommon-x11 libXcursor libXi libXrandr libXinerama && dnf clean all
 DOCKERFILE
 
-"$container" run --rm -v "$binary:/fixtester:ro" "$image" \
+"$container" run --rm -v "$binary:/fixtester:ro" -v "$tmp:/smoke" -e TMPDIR=/smoke "$image" \
     bash -ec 'cat /etc/almalinux-release
         Xvfb :88 -screen 0 1280x800x24 -nolisten tcp &
         xvfb=$!
@@ -63,7 +63,7 @@ DOCKERFILE
             [[ -S /tmp/.X11-unix/X88 ]] && break
             sleep 0.1
         done
-        DISPLAY=:88 LIBGL_ALWAYS_SOFTWARE=1 timeout 20 /fixtester --smoke --data-dir /tmp/fixtester-smoke'
+        DISPLAY=:88 LIBGL_ALWAYS_SOFTWARE=1 timeout 20 /fixtester --smoke --data-dir /smoke/data'
 if [[ -n "${2:-}" ]]; then
     install -m 0755 "$binary" "$2"
 fi

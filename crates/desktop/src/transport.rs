@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fix_session::{Role, SequenceNumbers, State};
 
-use crate::model::{Application, Order, SESSIONS_MAX, grouped::GroupedOrder};
+use crate::model::{Application, Order, SESSIONS_MAX, execution::Report, grouped::GroupedOrder};
 use crate::store::{SavedProfile, Store};
 use crate::{Result, invalid};
 
@@ -67,13 +67,20 @@ pub enum Send {
     Tags(Application),
     Order(Order),
     GroupedOrder(GroupedOrder),
+    Execution(Report),
+}
+
+#[derive(Debug)]
+struct SendRequest {
+    message: Send,
+    additional: String,
 }
 
 #[derive(Debug)]
 struct Worker {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
-    send: SyncSender<Send>,
+    send: SyncSender<SendRequest>,
     thread: JoinHandle<()>,
 }
 
@@ -167,6 +174,18 @@ impl Sessions {
     }
 
     pub fn send(&self, id: i64, message: Send) -> Result<()> {
+        self.send_with_additional_tags(id, message, "")
+    }
+
+    pub fn send_with_additional_tags(
+        &self,
+        id: i64,
+        message: Send,
+        additional: &str,
+    ) -> Result<()> {
+        if !additional.is_empty() && matches!(message, Send::Tags(_)) {
+            return Err(invalid("Enter raw tags in the tag editor."));
+        }
         let worker = self
             .workers
             .get(&id)
@@ -181,7 +200,10 @@ impl Sessions {
         // The acceptor changes phase under this lock before it drains commands.
         worker
             .send
-            .try_send(message)
+            .try_send(SendRequest {
+                message,
+                additional: additional.to_owned(),
+            })
             .map_err(|_| invalid("The session cannot accept another command."))
     }
 
@@ -207,7 +229,7 @@ impl Drop for Sessions {
 struct Control {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
-    commands: Receiver<Send>,
+    commands: Receiver<SendRequest>,
 }
 
 impl Control {

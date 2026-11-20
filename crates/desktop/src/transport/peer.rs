@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use fix_codec::{Decoder, Message, UtcMillis, frame, frame_with_checksum, tag};
 use fix_session::{Config, Event, Role, Session, SessionTime, State};
 
-use super::{Control, POLL, Phase, Send};
+use super::{Control, POLL, Phase, Send, SendRequest};
 use crate::model::{FIELDS_MAX, MESSAGE_MAX, OrderKind, OrderValues, now};
 use crate::store::{Checkpoint, Direction, Packet, SavedProfile, Store, Transition};
 use crate::{Error, Result, invalid};
@@ -201,11 +201,12 @@ impl Peer<'_> {
         self.commit(time.utc, Some((raw, "Received")), None)
     }
 
-    fn send(&mut self, command: Send) -> Result<()> {
+    fn send(&mut self, command: SendRequest) -> Result<()> {
         let time = self.time();
         let result = self
-            .prepare(command, time.utc)
+            .prepare(command.message, time.utc)
             .and_then(|(application, values)| {
+                let application = application.with_additional_tags(&command.additional)?;
                 self.session
                     .send_app_at(time, application.kind.as_bytes(), |body| {
                         for (tag, value) in &application.fields {
@@ -241,6 +242,17 @@ impl Peer<'_> {
             Send::Tags(_) => Err(invalid(
                 "Build the application message for the selected FIX version.",
             )),
+            Send::Execution(report) => {
+                if report.version() != self.saved.profile.version {
+                    return Err(invalid("Build the report for the selected FIX version."));
+                }
+                report.validate()?;
+                let exec_id = match report.exec_id() {
+                    Some(value) => value.into(),
+                    None => self.store.next_order_id(time)?,
+                };
+                Ok((report.application(time, exec_id)?, None))
+            }
             Send::GroupedOrder(order) => {
                 let id = self.store.next_order_id(time)?;
                 Ok((

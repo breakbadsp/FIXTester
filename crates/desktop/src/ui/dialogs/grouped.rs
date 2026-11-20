@@ -6,12 +6,13 @@ use fixtester_desktop::model::grouped::{
 };
 use fixtester_desktop::transport::Send;
 
-use super::{Dialog, Workspace, field, submit};
+use super::{Dialog, Workspace, additional, field, submit};
 
 pub(in crate::ui) struct GroupedDraft {
     pub(super) id: i64,
     pub(super) waiting: Option<u64>,
     order: GroupedOrder,
+    additional: String,
     version: Version,
 }
 
@@ -38,6 +39,7 @@ impl Workspace {
             id: saved.id,
             waiting: None,
             order,
+            additional: String::new(),
             version: saved.profile.version,
         }));
         self.notice.clear();
@@ -77,10 +79,15 @@ impl Workspace {
                 entries(ui, orders, 1, "order", list_fields, OrderValues::default);
             }
         }
+        additional::show(ui, &mut draft.additional, &mut self.notice);
         match submit(ui, "Send") {
             Some(false) => false,
             Some(true) => {
-                match self.queue(draft.id, Send::GroupedOrder(draft.order.clone())) {
+                match self.queue(
+                    draft.id,
+                    Send::GroupedOrder(draft.order.clone()),
+                    &draft.additional,
+                ) {
                     Ok(epoch) => {
                         draft.waiting = Some(epoch);
                         self.notice.clear();
