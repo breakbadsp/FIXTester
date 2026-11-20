@@ -241,6 +241,17 @@ impl Peer<'_> {
             Send::Tags(_) => Err(invalid(
                 "Build the application message for the selected FIX version.",
             )),
+            Send::Execution(report) => {
+                if report.version() != self.saved.profile.version {
+                    return Err(invalid("Build the report for the selected FIX version."));
+                }
+                report.validate()?;
+                let exec_id = match report.exec_id() {
+                    Some(value) => value.into(),
+                    None => self.store.next_order_id(time)?,
+                };
+                Ok((report.application(time, exec_id)?, None))
+            }
             Send::GroupedOrder(order) => {
                 let id = self.store.next_order_id(time)?;
                 Ok((

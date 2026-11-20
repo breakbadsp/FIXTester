@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fix_session::{Role, SequenceNumbers, State};
 
-use crate::model::{Application, Order, SESSIONS_MAX, grouped::GroupedOrder};
+use crate::model::{Application, Order, SESSIONS_MAX, execution::Report, grouped::GroupedOrder};
 use crate::store::{SavedProfile, Store};
 use crate::{Result, invalid};
 
@@ -67,6 +67,7 @@ pub enum Send {
     Tags(Application),
     Order(Order),
     GroupedOrder(GroupedOrder),
+    Execution(Report),
 }
 
 #[derive(Debug)]

@@ -3,10 +3,13 @@ use std::time::Instant;
 use eframe::egui::{self, RichText, TextStyle};
 use fix_codec::{Decoder, write_utc_timestamp};
 use fix_dict::Version;
-use fixtester_desktop::model::{FIELDS_MAX, OrderKind};
+use fixtester_desktop::model::{FIELDS_MAX, OrderKind, execution::Source};
 use fixtester_desktop::store::{Direction, Entry, PAGE_ROWS, escape};
 
-use super::{ACCENT, MUTED, SURFACE, Workspace, dialogs::Dialog};
+use super::{
+    ACCENT, MUTED, SURFACE, Workspace,
+    dialogs::{Dialog, execution},
+};
 use fixtester_desktop::store::SavedProfile;
 
 impl Workspace {
@@ -82,6 +85,62 @@ impl Workspace {
     }
 
     fn rows(&mut self, ui: &mut egui::Ui, version: Version) {
+        self.timeline_pagination(ui);
+        ui.label(
+            RichText::new(format!(
+                "{:<21} {:<3} {:>6}  {:<26} {}",
+                "UTC", "I/O", "SEQ", "MESSAGE", "SUMMARY"
+            ))
+            .monospace()
+            .color(MUTED),
+        );
+        if self.entries.is_empty() {
+            ui.label(RichText::new("No matching messages.").color(MUTED));
+            return;
+        }
+        let active = self.active();
+        let mut execution_draft = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("messages", self.selected, self.pages.len()))
+            .max_height(ui.available_height())
+            .show_rows(ui, 25.0, self.entries.len(), |ui, range| {
+                for index in range {
+                    let row = &self.entries[index];
+                    let color = if row.direction == Direction::Received {
+                        ACCENT
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    let label = row_label(row, version);
+                    let button = egui::Button::selectable(
+                        self.selected_row == Some(row.id),
+                        RichText::new(label).monospace().color(color),
+                    )
+                    .truncate()
+                    .min_size(egui::vec2(ui.available_width(), 25.0));
+                    let row_scope =
+                        egui::UiBuilder::new().scope_id(egui::Id::unique(("timeline-row", row.id)));
+                    let response = ui
+                        .scope_builder(row_scope, |ui| ui.add(button))
+                        .inner
+                        .on_hover_text(format!("{} · {}", row.status, row.summary));
+                    let can_report = active && Source::identify(version, row).is_some();
+                    if response.clicked() || (can_report && response.secondary_clicked()) {
+                        self.selected_row = Some(row.id);
+                    }
+                    if can_report {
+                        response.context_menu(|ui| {
+                            if let Some(draft) = execution::menu(ui, version, row) {
+                                execution_draft = Some(draft);
+                            }
+                        });
+                    }
+                }
+            });
+        self.open_execution(execution_draft);
+    }
+
+    fn timeline_pagination(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!self.pages.is_empty(), egui::Button::new("Newer"))
@@ -111,45 +170,6 @@ impl Workspace {
                 .color(MUTED),
             );
         });
-        ui.label(
-            RichText::new(format!(
-                "{:<21} {:<3} {:>6}  {:<26} {}",
-                "UTC", "I/O", "SEQ", "MESSAGE", "SUMMARY"
-            ))
-            .monospace()
-            .color(MUTED),
-        );
-        if self.entries.is_empty() {
-            ui.label(RichText::new("No matching messages.").color(MUTED));
-            return;
-        }
-        egui::ScrollArea::vertical()
-            .id_salt(("messages", self.selected, self.pages.len()))
-            .max_height(ui.available_height())
-            .show_rows(ui, 25.0, self.entries.len(), |ui, range| {
-                for index in range {
-                    let row = &self.entries[index];
-                    let color = if row.direction == Direction::Received {
-                        ACCENT
-                    } else {
-                        ui.visuals().text_color()
-                    };
-                    let label = row_label(row, version);
-                    let button = egui::Button::selectable(
-                        self.selected_row == Some(row.id),
-                        RichText::new(label).monospace().color(color),
-                    )
-                    .truncate()
-                    .min_size(egui::vec2(ui.available_width(), 25.0));
-                    if ui
-                        .add(button)
-                        .on_hover_text(format!("{} · {}", row.status, row.summary))
-                        .clicked()
-                    {
-                        self.selected_row = Some(row.id);
-                    }
-                }
-            });
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, version: Version, row: &Entry) {
@@ -169,6 +189,18 @@ impl Workspace {
                 .clicked()
             {
                 ui.ctx().copy_text(escape(&row.raw));
+            }
+            if self.active() && Source::identify(version, row).is_some() {
+                let scope = egui::UiBuilder::new()
+                    .scope_id(egui::Id::unique(("inspector-execution", row.id)));
+                let draft = ui
+                    .scope_builder(scope, |ui| {
+                        ui.menu_button("Execution actions", |ui| execution::menu(ui, version, row))
+                            .inner
+                            .flatten()
+                    })
+                    .inner;
+                self.open_execution(draft);
             }
             if self.active()
                 && row.direction == Direction::Sent

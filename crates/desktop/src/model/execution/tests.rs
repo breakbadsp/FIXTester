@@ -1,0 +1,250 @@
+#![allow(clippy::unwrap_used)]
+
+use fix_codec::Encoder;
+
+use super::*;
+use crate::store::{Direction, Entry};
+
+fn received(version: Version, kind: &str, body: &[(u32, &str)]) -> Context {
+    let mut encoder = Encoder::new(1024);
+    let mut message = encoder.start(kind.as_bytes());
+    message.field(34, b"1");
+    for (tag, value) in body {
+        message.field(*tag, value.as_bytes());
+    }
+    let raw = message
+        .finish(version.begin_string().as_bytes())
+        .unwrap()
+        .to_vec();
+    Context::read(
+        version,
+        &Entry {
+            id: 7,
+            time: UtcMillis(0),
+            direction: Direction::Received,
+            kind: kind.into(),
+            seq: "1".into(),
+            summary: String::new(),
+            status: "Received".into(),
+            transferred: raw.len(),
+            raw,
+        },
+    )
+    .unwrap()
+}
+
+fn fill_inputs(report: &mut Report) {
+    for field in report.fields_mut() {
+        if field.required && field.value.is_empty() {
+            field.value = match field.tag {
+                6 | 31 => "10.25",
+                14 | 32 => "2",
+                151 => "3",
+                19 => "TRADE-1",
+                39 => "1",
+                378 => "0",
+                _ => "",
+            }
+            .into();
+        }
+    }
+    if let Some(reference) = report.reference_fill_type() {
+        "2".clone_into(reference);
+    }
+}
+
+#[test]
+fn all_execution_actions_use_standard_version_codes() {
+    use Action::{
+        Acknowledge, Bust, Calculated, Cancel, Correct, DoneForDay, Expire, FullFill, PartialFill,
+        PendingCancel, PendingNew, PendingReplace, Reject, Replace, Restate, Status, Stopped,
+        Suspended,
+    };
+    // Each row gives action, source, 4.2 transaction, 4.2 and later execution types, and order status.
+    let cases = [
+        (PendingNew, "D", "0", "A", "A", "A"),
+        (Acknowledge, "D", "0", "0", "0", "0"),
+        (Reject, "D", "0", "8", "8", "8"),
+        (PartialFill, "D", "0", "1", "F", "1"),
+        (FullFill, "D", "0", "2", "F", "2"),
+        (PendingCancel, "F", "0", "6", "6", "6"),
+        (Cancel, "F", "0", "4", "4", "4"),
+        (PendingReplace, "G", "0", "E", "E", "E"),
+        (Replace, "G", "0", "5", "5", "5"),
+        (Expire, "D", "0", "C", "C", "C"),
+        (DoneForDay, "D", "0", "3", "3", "3"),
+        (Stopped, "D", "0", "7", "7", "7"),
+        (Suspended, "D", "0", "9", "9", "9"),
+        (Calculated, "D", "0", "B", "B", "B"),
+        (Restate, "D", "0", "D", "D", "1"),
+        (Status, "H", "3", "1", "I", "1"),
+        (Correct, "D", "2", "2", "G", "1"),
+        (Bust, "D", "1", "2", "H", "1"),
+    ];
+    for version in [Version::Fix42, Version::Fix43, Version::Fix44] {
+        for (action, source, trans, legacy, modern, status) in cases {
+            let context = received(
+                version,
+                source,
+                &[
+                    (11, "CURRENT"),
+                    (37, "ORDER-1"),
+                    (41, "ORIGINAL"),
+                    (54, "1"),
+                    (55, "XYZ"),
+                    (38, "5"),
+                ],
+            );
+            let mut report = Report::draft(&context, None, action).unwrap();
+            for field in report.fields_mut() {
+                if field.tag == 38 && field.value.is_empty() {
+                    "5".clone_into(&mut field.value);
+                }
+            }
+            fill_inputs(&mut report);
+            let (exec_type, transaction) = if version == Version::Fix42 {
+                (legacy, Some(trans))
+            } else {
+                (modern, None)
+            };
+            let status = if action == Replace && version == Version::Fix44 {
+                "1"
+            } else {
+                status
+            };
+            assert_report(&report, version, exec_type, transaction, status);
+        }
+    }
+}
+
+fn assert_report(
+    report: &Report,
+    version: Version,
+    exec_type: &str,
+    transaction: Option<&str>,
+    status: &str,
+) {
+    use Action::{Bust, Correct, FullFill, PartialFill, Restate, Status};
+    let action = report.action;
+    let exec_id = if action == Status { "0" } else { "EXEC-2" };
+    let app = report.application(UtcMillis(0), exec_id.into()).unwrap();
+    assert_eq!(app.kind, "8");
+    let legacy_version = version == Version::Fix42;
+    let value = |tag| {
+        app.fields
+            .iter()
+            .find(|(num, _)| *num == tag)
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(value(39), Some(status), "{version:?} {action:?}");
+    assert_eq!(value(150), Some(exec_type));
+    assert_eq!(value(20), transaction);
+    assert_eq!(
+        value(19),
+        matches!(action, Correct | Bust).then_some("TRADE-1")
+    );
+    assert_eq!(value(378), (action == Restate).then_some("0"));
+    assert_eq!(value(17), Some(exec_id));
+    if matches!(action, PartialFill | FullFill | Correct) {
+        assert_eq!(value(31), Some("10.25"));
+        assert_eq!(value(32), Some("2"));
+    } else if legacy_version && action != Status {
+        assert_eq!(value(31), Some("0"));
+        assert_eq!(value(32), Some("0"));
+    } else {
+        assert_eq!(value(31), None);
+        assert_eq!(value(32), None);
+    }
+    let dict = version.dictionary();
+    for tag in dict.message("8").unwrap().body.required {
+        assert!(value(*tag).is_some(), "{version:?} {action:?} tag {tag}");
+    }
+    for (tag, data) in &app.fields {
+        assert!(
+            dict.is_valid_value(*tag, data),
+            "{version:?} {action:?} tag {tag}"
+        );
+    }
+}
+
+#[test]
+fn request_rejections_keep_chain_and_reject_the_request() {
+    for version in [Version::Fix42, Version::Fix43, Version::Fix44] {
+        for (kind, action, code) in [
+            ("F", Action::RejectCancel, "1"),
+            ("G", Action::RejectReplace, "2"),
+            ("AC", Action::RejectReplace, "2"),
+        ] {
+            if version == Version::Fix42 && kind == "AC" {
+                continue;
+            }
+            let context = received(
+                version,
+                kind,
+                &[(11, "REQUEST"), (41, "WORKING"), (37, "OID-3")],
+            );
+            assert!(Report::draft(&context, None, Action::Reject).is_err());
+            let mut report = Report::draft(&context, None, action).unwrap();
+            assert!(report.validate().is_err());
+            fill_inputs(&mut report);
+            let app = report.application(UtcMillis(0), String::new()).unwrap();
+            assert_eq!(app.kind, "9");
+            let find = |tag| {
+                app.fields
+                    .iter()
+                    .find(|(num, _)| *num == tag)
+                    .map(|(_, value)| value.as_str())
+            };
+            for (tag, value) in [
+                (11, "REQUEST"),
+                (37, "OID-3"),
+                (41, "WORKING"),
+                (39, "1"),
+                (434, code),
+            ] {
+                assert_eq!(find(tag), Some(value));
+            }
+            for tag in [17, 20, 150] {
+                assert_eq!(find(tag), None);
+            }
+        }
+    }
+}
+
+#[test]
+fn fills_and_status_require_explicit_context_when_the_order_has_no_state() {
+    let context = received(
+        Version::Fix44,
+        "D",
+        &[
+            (11, "REQUEST"),
+            (55, "XYZ"),
+            (54, "1"),
+            (38, "5"),
+            (44, "10"),
+        ],
+    );
+    for action in [
+        Action::PartialFill,
+        Action::FullFill,
+        Action::Status,
+        Action::Correct,
+        Action::Bust,
+    ] {
+        let mut report = Report::draft(&context, None, action).unwrap();
+        assert!(report.validate().is_err());
+        for field in report.fields_mut() {
+            if matches!(field.tag, 14 | 6 | 31 | 32 | 19) {
+                assert_eq!(field.value, "");
+            }
+        }
+    }
+    let status = received(
+        Version::Fix44,
+        "H",
+        &[(11, "REQUEST"), (55, "XYZ"), (54, "1")],
+    );
+    let report = Report::draft(&status, None, Action::Status).unwrap();
+    assert_eq!(report.value(37), "");
+    assert!(Report::draft(&status, None, Action::Cancel).is_err());
+}

@@ -372,3 +372,292 @@ fn manual_replace(ui: &mut Driver, peer: &mut Wire, previous: &[u8]) {
         assert_eq!(fields.get(carried), None);
     }
 }
+
+fn choose_status(ui: &mut Driver, status: &str) {
+    let dropdown = ui.wait_for(accesskit::Role::ComboBox, "OrdStatus");
+    ui.action(dropdown, accesskit::Action::Click);
+    ui.click(status);
+}
+
+fn right_click_row(ui: &mut Driver, label: &str) {
+    let id = ui.wait_for(accesskit::Role::Button, label);
+    let rect = ui
+        .nodes
+        .iter()
+        .find(|(node, _)| *node == id)
+        .unwrap()
+        .1
+        .bounds()
+        .unwrap();
+    #[allow(clippy::cast_possible_truncation)]
+    let pos = egui::pos2(
+        f32::midpoint(rect.x0 as f32, rect.x1 as f32),
+        f32::midpoint(rect.y0 as f32, rect.y1 as f32),
+    );
+    ui.frame(vec![Event::PointerMoved(pos)], Modifiers::NONE);
+    for pressed in [true, false] {
+        ui.frame(
+            vec![Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }],
+            Modifiers::NONE,
+        );
+    }
+}
+
+#[test]
+fn execution_context_menu_sends_reports_and_uses_sent_trade_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("report.db"));
+    peer.send(
+        b"D",
+        2,
+        &[
+            (11, b"ORDER-42"),
+            (55, b"WIDGET"),
+            (54, b"1"),
+            (38, b"10"),
+            (40, b"2"),
+            (44, b"19.50"),
+        ],
+    );
+    right_click_row(&mut ui, "NewOrderSingle");
+    ui.click("Acknowledge");
+    ui.wait_for(accesskit::Role::TextInput, "OrderID");
+    ui.click("Send");
+
+    let mut decoder = Decoder::new(256);
+    let raw = peer.receive(b"8", 2);
+    let ack = decoder.decode(&raw).unwrap().fields();
+    let order_id = ack.get(37).unwrap().to_vec();
+    let ack_id = ack.get(17).unwrap().to_vec();
+    assert_eq!(ack.get(11), Some(b"ORDER-42".as_slice()));
+    assert_eq!(ack.get(150), Some(b"0".as_slice()));
+    assert_eq!(ack.get(39), Some(b"0".as_slice()));
+    assert_eq!(ack.get(151), Some(b"10".as_slice()));
+    assert_eq!(ack.get(32), None);
+    ui.wait_for_workspace();
+
+    ui.click("Execution actions");
+    ui.click("Partial fill");
+    ui.click("Send");
+    ui.wait_for(accesskit::Role::Label, "Enter CumQty");
+    ui.enter("CumQty", "2");
+    ui.enter("LeavesQty", "8");
+    ui.enter("AvgPx", "19.25");
+    ui.enter("LastQty", "2");
+    ui.enter("LastPx", "19.25");
+    ui.click("Send");
+
+    let raw = peer.receive(b"8", 3);
+    let trade = decoder.decode(&raw).unwrap().fields();
+    let trade_id = trade.get(17).unwrap().to_vec();
+    assert_ne!(ack_id, trade_id);
+    assert!(trade_id.starts_with(b"FT-"));
+    for (tag, value) in [
+        (37, order_id.as_slice()),
+        (150, b"F"),
+        (39, b"1"),
+        (32, b"2"),
+        (31, b"19.25"),
+    ] {
+        assert_eq!(trade.get(tag), Some(value));
+    }
+    ui.wait_for_workspace();
+
+    ui.click("ExecutionReport");
+    ui.click("Execution actions");
+    ui.click("Trade bust");
+    choose_status(&mut ui, "0 · New");
+    ui.enter("CumQty", "0");
+    ui.enter("LeavesQty", "10");
+    ui.enter("AvgPx", "0");
+    ui.click("Send");
+    let raw = peer.receive(b"8", 4);
+    let bust = decoder.decode(&raw).unwrap().fields();
+    assert_eq!(bust.get(19), Some(trade_id.as_slice()));
+    assert_eq!(bust.get(37), Some(order_id.as_slice()));
+    assert_eq!(bust.get(150), Some(b"H".as_slice()));
+    assert_eq!(bust.get(39), Some(b"0".as_slice()));
+    assert_eq!(bust.get(32), None);
+}
+
+#[test]
+fn execution_actions_use_the_selected_list_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("list-report.db"));
+    peer.send(
+        b"E",
+        2,
+        &[
+            (66, b"LIST-9"),
+            (394, b"1"),
+            (68, b"2"),
+            (73, b"2"),
+            (11, b"CHILD-FIRST"),
+            (67, b"1"),
+            (55, b"ALPHA"),
+            (54, b"1"),
+            (38, b"10"),
+            (40, b"2"),
+            (44, b"3.50"),
+            (11, b"CHILD-SECOND"),
+            (67, b"2"),
+            (55, b"BETA"),
+            (54, b"2"),
+            (38, b"20"),
+            (40, b"2"),
+            (44, b"4.25"),
+        ],
+    );
+    ui.click("NewOrderList");
+    ui.click("Execution actions");
+    ui.wait_for(accesskit::Role::Label, "Select a list order");
+    assert!(ui.find(accesskit::Role::Button, "Acknowledge").is_none());
+    ui.click("CHILD-SECOND");
+    ui.click("Acknowledge");
+    ui.click("Send");
+    let raw = peer.receive(b"8", 2);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    for (tag, value) in [
+        (66, b"LIST-9".as_slice()),
+        (11, b"CHILD-SECOND"),
+        (55, b"BETA"),
+        (54, b"2"),
+        (38, b"20"),
+        (44, b"4.25"),
+        (151, b"20"),
+    ] {
+        assert_eq!(fields.get(tag), Some(value));
+    }
+    assert_eq!(fields.get(73), None);
+}
+
+#[test]
+fn multileg_execution_and_replace_reject_keep_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("multileg-report.db"));
+    let legs = [
+        (555, b"2".as_slice()),
+        (600, b"FUT-Z"),
+        (602, b"DEC"),
+        (603, b"8"),
+        (604, b"1"),
+        (605, b"ALT-Z"),
+        (606, b"8"),
+        (610, b"202712"),
+        (623, b"1"),
+        (624, b"1"),
+        (600, b"FUT-H"),
+        (610, b"202803"),
+        (623, b"2"),
+        (624, b"2"),
+    ];
+    let mut order = vec![
+        (11, b"SPREAD".as_slice()),
+        (55, b"STRATEGY"),
+        (54, b"B"),
+        (38, b"3"),
+        (40, b"2"),
+        (44, b"-0.25"),
+    ];
+    order.extend(legs);
+    peer.send(b"AB", 2, &order);
+    ui.click("NewOrderMultileg");
+    ui.click("Execution actions");
+    ui.click("Acknowledge");
+    ui.click("Send");
+    let raw = peer.receive(b"8", 2);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    let order_id = fields.get(37).unwrap().to_vec();
+    assert_eq!(fields.get(11), Some(b"SPREAD".as_slice()));
+    assert_eq!(fields.get(442), Some(b"3".as_slice()));
+    assert_eq!(fields.get(44), Some(b"-0.25".as_slice()));
+    let definition = Version::Fix44.dictionary().group("8", 555).unwrap();
+    let group = fields.group(definition).unwrap().unwrap();
+    let entries = group.entries().collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].iter().collect::<Vec<_>>(), legs[1..10]);
+    assert_eq!(entries[1].iter().collect::<Vec<_>>(), legs[10..]);
+    ui.wait_for_workspace();
+
+    let mut replace = vec![
+        (11, b"CHANGE".as_slice()),
+        (41, b"SPREAD"),
+        (37, &order_id),
+        (55, b"STRATEGY"),
+        (54, b"B"),
+        (38, b"3"),
+        (40, b"2"),
+        (44, b"-0.15"),
+    ];
+    replace.extend(legs);
+    peer.send(b"AC", 3, &replace);
+    ui.click("MultilegOrderCancelReplace");
+    ui.click("Execution actions");
+    assert!(ui.find(accesskit::Role::Button, "Reject order").is_none());
+    ui.click("Reject replace request");
+    choose_status(&mut ui, "0 · New");
+    ui.click("Send");
+    let raw = peer.receive(b"9", 3);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    for (tag, value) in [
+        (37, order_id.as_slice()),
+        (11, b"CHANGE"),
+        (41, b"SPREAD"),
+        (434, b"2"),
+        (39, b"0"),
+    ] {
+        assert_eq!(fields.get(tag), Some(value));
+    }
+    assert_eq!(fields.get(150), None);
+    assert_eq!(fields.get(555), None);
+}
+
+#[test]
+fn execution_status_echoes_the_status_request_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("status-report.db"));
+    peer.send(
+        b"H",
+        2,
+        &[
+            (11, b"ORDER-7"),
+            (37, b"VENUE-7"),
+            (55, b"XYZ"),
+            (54, b"1"),
+            (790, b"QUERY-9"),
+        ],
+    );
+    ui.click("OrderStatusRequest");
+    ui.click("Execution actions");
+    assert!(ui.find(accesskit::Role::Button, "Acknowledge").is_none());
+    ui.click("Order status");
+    choose_status(&mut ui, "1 · PartiallyFilled");
+    ui.enter("OrderQty", "12");
+    ui.enter("CumQty", "3");
+    ui.enter("LeavesQty", "9");
+    ui.enter("AvgPx", "5.25");
+    ui.click("Send");
+
+    let raw = peer.receive(b"8", 2);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    for (tag, value) in [
+        (11, b"ORDER-7".as_slice()),
+        (37, b"VENUE-7"),
+        (790, b"QUERY-9"),
+        (17, b"0"),
+        (39, b"1"),
+        (150, b"I"),
+    ] {
+        assert_eq!(fields.get(tag), Some(value));
+    }
+    assert_eq!(fields.get(20), None);
+    assert_eq!(fields.get(31), None);
+}

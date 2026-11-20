@@ -78,6 +78,40 @@ Enter 1 to 16 single Limit orders with no bidding process. FIXTester
 assigns the list ID, the order IDs, and the group counts. Use the tag
 editor when a venue requires fields outside these dialogs.
 
+### Reply to received orders
+
+On an active session, right-click a received order in the timeline or
+select it and use **Execution actions** in the inspector. For a list,
+select the child by ClOrdID before you choose an action. The form opens
+with the selected fields. Review or edit them before you select **Send**.
+
+- New orders (`D`, `AB`, and children of `E`) support pending new,
+  acknowledgement, rejection, partial and full fills, cancel, status,
+  expire, done for day, stopped, suspended, calculated, restatement,
+  trade correction, and trade bust.
+- Cancel (`F`) and replace (`G`, `AC`) requests offer pending, accepted,
+  and rejected responses to that request. Rejection uses
+  `OrderCancelReject` (`35=9`). Order status requests (`H`) offer a
+  status report.
+- To correct or bust a trade, select a sent fill or correction to copy
+  its ExecID into ExecRefID. You can also enter ExecRefID from a received
+  new order or list child. Enter the resulting order totals. For FIX 4.2,
+  select the referenced fill type when you enter ExecRefID manually.
+
+FIXTester proposes an editable OrderID from the new order's timeline
+record. It proposes a different ID for each list child. On later
+requests, FIXTester copies the supplied OrderID. If the request omits it,
+enter the ID from the earlier report. If you changed the proposed
+OrderID, reuse that value for later reports. FIXTester assigns ExecID
+on Send. A status report uses ExecID `0`.
+
+For multileg orders on FIX 4.3 and 4.4, the form builds a strategy report
+and carries compatible leg fields in dictionary order. Expand
+**Additional FIX fields** to inspect the leg fields. Enter cumulative
+values and trade prices and quantities as the scenario requires. Use
+the tag editor for individual leg executions, custom venue fields, or
+manual changes to the carried leg group.
+
 The tag editor accepts an application MsgType, such as `8` for an
 Execution Report, and one `Tag=Value` per line. It accepts custom tags
 and application MsgTypes. It handles the standard header, framing, and
@@ -180,7 +214,10 @@ The workspace tests include real loopback TCP for both roles, all three
 versions, eight simultaneous sessions, restart, reset, gaps, and
 heartbeat recovery. The egui test drives keyboard and accessibility
 events in the real workspace code and checks the New, report, Replace,
-and Cancel workflow over TCP. The write failure test checks the saved
+and Cancel workflow over TCP. Execution tests use a timeline right-click,
+the inspector, a list child, and a multileg request. They inspect the
+reports and references received over loopback TCP. The write failure
+test checks the saved
 sequence and the exported byte prefix. Storage tests cover quota
 boundaries, migration, concurrent writes, and a purge and WAL truncate
 checkpoint during a blocked export write.

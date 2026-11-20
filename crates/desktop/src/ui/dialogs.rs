@@ -1,3 +1,4 @@
+pub(super) mod execution;
 mod grouped;
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub(super) enum Dialog {
     Order(OrderDraft),
     Tags(TagDraft),
     Grouped(grouped::GroupedDraft),
+    Execution(execution::ExecutionDraft),
     Reset(i64),
     Export(String),
 }
@@ -164,6 +166,7 @@ impl Workspace {
             Dialog::Order(draft) => draft.waiting.is_some(),
             Dialog::Tags(draft) => draft.waiting.is_some(),
             Dialog::Grouped(draft) => draft.waiting.is_some(),
+            Dialog::Execution(draft) => draft.waiting.is_some(),
             _ => false,
         };
         let mut open = true;
@@ -178,6 +181,7 @@ impl Workspace {
                 Dialog::Order(draft) => open = self.order_dialog(ui, draft),
                 Dialog::Tags(draft) => open = self.tags_dialog(ui, draft),
                 Dialog::Grouped(draft) => open = self.grouped_dialog(ui, draft),
+                Dialog::Execution(draft) => open = self.execution_dialog(ui, draft),
                 Dialog::Profile(draft) => open = self.profile_dialog(ui, draft),
                 Dialog::Reset(id) => open = self.reset_dialog(ui, *id),
                 Dialog::Export(path) => open = self.export_dialog(ui, path),
@@ -200,6 +204,7 @@ impl Workspace {
             Dialog::Order(draft) => (draft.id, &mut draft.waiting),
             Dialog::Tags(draft) => (draft.id, &mut draft.waiting),
             Dialog::Grouped(draft) => (draft.id, &mut draft.waiting),
+            Dialog::Execution(draft) => (draft.id, &mut draft.waiting),
             _ => return false,
         };
         let (Some(previous), Some(status)) = (*waiting, self.sessions.status(id)) else {
