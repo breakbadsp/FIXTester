@@ -200,17 +200,12 @@ impl Peer<'_> {
             self.commit(time.utc, Some((raw, "Rejected input")), None)?;
             return Err(error);
         }
-        let target_before = self.session.sequence_numbers().next_target;
+        let reset_mode_target = (message.msg_type() == tag::msg_type::SEQUENCE_RESET
+            && message.fields().get_bool(tag::GAP_FILL_FLAG) == Some(false))
+        .then(|| self.session.sequence_numbers().next_target);
         let disposition = self.session.on_message_at(time, &message);
         if self.session.state() == State::Active {
             self.reset_armed = false;
-        }
-        if message.msg_type() == tag::msg_type::SEQUENCE_RESET
-            && message.fields().get_bool(tag::GAP_FILL_FLAG) != Some(true)
-            && self.session.sequence_numbers().next_target != target_before
-            && let Some(automation) = &mut self.automation
-        {
-            automation.clear_live();
         }
         let plan = match &mut self.automation {
             Some(automation)
@@ -228,7 +223,7 @@ impl Peer<'_> {
             Err(Error::Invalid(reason)) => format!("{SKIPPED}{reason}"),
             _ => "Received".into(),
         };
-        self.commit(time.utc, Some((raw, &note)), None)?;
+        self.commit_transition(time.utc, Some((raw, &note)), None, reset_mode_target)?;
         match plan {
             Ok(Some(plan)) => self.send_automatic(time, plan),
             Err(Error::Invalid(_)) => {
@@ -360,6 +355,16 @@ impl Peer<'_> {
         received: Option<(&[u8], &str)>,
         values: Option<&OrderValues>,
     ) -> Result<()> {
+        self.commit_transition(time, received, values, None)
+    }
+
+    fn commit_transition(
+        &mut self,
+        time: UtcMillis,
+        received: Option<(&[u8], &str)>,
+        values: Option<&OrderValues>,
+        reset_mode_target: Option<u64>,
+    ) -> Result<()> {
         self.output.clear();
         self.session.take_output(&mut self.output);
         let seq = self.session.sequence_numbers();
@@ -395,11 +400,18 @@ impl Peer<'_> {
             });
             result?;
         }
-        let note = self
-            .session
-            .take_events()
-            .filter_map(event_note)
-            .next_back();
+        let mut note = None;
+        for event in self.session.take_events() {
+            if let Event::SequenceReset { new_seq } = event
+                && reset_mode_target.is_some_and(|previous| new_seq > previous)
+                && let Some(automation) = &mut self.automation
+            {
+                automation.clear_live();
+            }
+            if let Some(event_note) = event_note(event) {
+                note = Some(event_note);
+            }
+        }
         self.control.update(|status| {
             status.phase = Phase::Link(self.session.state());
             status.seq = seq;

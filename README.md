@@ -64,12 +64,15 @@ quantity. Prices and quantities support six decimal places. Leave the
 fill price override blank to use the active limit price. A Market order
 requires an override for a fill. Replace and Cancel use OrigClOrdID to
 find the current order and check OrderID if the request includes it.
+If an accepted replacement asks for less than CumQty, the report sets
+OrderQty to CumQty and closes the order without an additional trade.
 
 Automation handles single-order `D`, `G`, and `F` requests for Day and
 GTC Limit or Market orders. Use the manual actions for order lists,
 multileg orders, and other messages. If a rule cannot run, the timeline
 shows **Automation skipped** with the reason. Examples include unknown
-references, unsupported terms, and partial quantities too large to use.
+references, MinQty (110), unsupported terms, and partial quantities too
+large to use.
 An unseen request marked PossDup or PossResend also goes to manual handling.
 
 An acceptor tracks up to 256 live automated orders and remembers up to

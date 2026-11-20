@@ -22,7 +22,7 @@ const MAX_ID_LEN: usize = 128;
 const MAX_REJECT_TEXT: usize = 120;
 const SCALE: u64 = 1_000_000;
 const INSTRUMENT_AND_CURRENCY: &[u32] = &[
-    15, 22, 48, 54, 55, 65, 167, 200, 201, 202, 205, 206, 207, 223, 231, 460, 461, 541, 762,
+    15, 22, 48, 54, 55, 65, 167, 200, 201, 202, 205, 206, 207, 223, 231, 460, 461, 541, 762, 947,
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -149,6 +149,7 @@ fn positive(value: &str, error: &str) -> Result<u64> {
         {
             return None;
         }
+        let whole = if whole.is_empty() { "0" } else { whole };
         let mut scaled = whole.parse::<u64>().ok()?.checked_mul(SCALE)?;
         if !fraction.is_empty() {
             let exponent = u32::try_from(6 - fraction.len()).ok()?;
@@ -276,6 +277,9 @@ fn identifier(fields: Fields<'_>, tag: u32) -> Result<&str> {
 }
 
 fn read_terms(version: Version, kind: &str, fields: Fields<'_>) -> Result<OrderContext> {
+    if fields.get(110).is_some() {
+        return Err(invalid("Use manual actions for MinQty (110)."));
+    }
     let dict = version.dictionary();
     let (Some(request), Some(report)) = (dict.message(kind), dict.message("8")) else {
         return Err(invalid("This request is not in the FIX dictionary."));

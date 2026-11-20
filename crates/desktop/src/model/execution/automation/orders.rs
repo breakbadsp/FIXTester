@@ -62,7 +62,9 @@ impl Plan {
             let mut report = order.report(version, source, Action::Replace);
             report.set(39, order.status(version));
             let mut reports = vec![report];
-            reports.extend(order.fill(version, rule)?);
+            if order.leaves() > 0 {
+                reports.extend(order.fill(version, rule)?);
+            }
             let live = (order.leaves() > 0).then_some(order);
             return Self::finish(reports, previous, live);
         }
@@ -160,14 +162,17 @@ impl LiveOrder {
         Ok(())
     }
 
-    fn replace(&mut self, terms: OrderContext) -> Result<()> {
+    fn replace(&mut self, mut terms: OrderContext) -> Result<()> {
         let (quantity, limit) = Self::read_size(&terms)?;
-        if quantity < self.cum {
-            return Err(invalid("The replacement quantity is below CumQty."));
+        // C.3.c cancels the balance and keeps the executed quantity.
+        if quantity < self.cum
+            && let Some((_, value)) = terms.fields.iter_mut().find(|(tag, _)| *tag == 38)
+        {
+            *value = decimal(self.cum);
         }
         // A missing TimeInForce means Day. The replacement supplies the new terms.
         self.terms = terms;
-        self.quantity = quantity;
+        self.quantity = quantity.max(self.cum);
         self.limit = limit;
         self.replaced = true;
         Ok(())
@@ -225,6 +230,9 @@ impl LiveOrder {
     fn report(&self, version: Version, source: Source, action: Action) -> Report {
         let mut report =
             Report::for_order(version, source, &self.terms, &self.order_id, "", action);
+        if version == Version::Fix44 {
+            report.field(947, self.terms.value(947), false, true);
+        }
         let average = if self.cum == 0 {
             0
         } else {

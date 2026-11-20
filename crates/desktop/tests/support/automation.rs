@@ -633,11 +633,160 @@ fn only_an_accepted_sequence_reset_clears_the_live_order() {
     f.expect(b"8", 2, &[(11, b"new")]);
     f.wire.send(b"4", 3, &[(36, b"2")]);
     f.expect(b"3", 3, &[(45, b"3")]);
-    request(&mut f.wire, b"G", 3, b"replace", b"new", b"10", b"11");
-    f.expect(b"8", 4, &[(11, b"replace"), (150, b"5")]);
+    f.wire.send(b"4", 3, &[(123, b"X"), (36, b"4")]);
+    f.expect(b"3", 4, &[(45, b"3")]);
+    f.wire.send(b"4", 4, &[(43, b"Y"), (123, b"N"), (36, b"5")]);
+    f.expect(b"3", 5, &[(45, b"4")]);
+    f.wire.send(b"4", 5, &[(123, b"Y"), (36, b"7")]);
+    request(&mut f.wire, b"G", 7, b"replace", b"new", b"10", b"11");
+    f.expect(b"8", 6, &[(11, b"replace"), (150, b"5")]);
 
-    f.wire.send(b"4", 4, &[(36, b"9")]);
-    request(&mut f.wire, b"F", 9, b"cancel", b"replace", b"10", b"");
-    f.silent(10, 5);
-    f.expect_manual("9", "no live automated order");
+    f.wire.send(b"4", 8, &[(123, b"N"), (36, b"10")]);
+    request(&mut f.wire, b"F", 10, b"cancel", b"replace", b"10", b"");
+    f.silent(11, 7);
+    f.expect_manual("10", "no live automated order");
+}
+
+#[test]
+fn minimum_quantity_requires_manual_handling() {
+    let mut f = Fixture::start(
+        Role::Acceptor,
+        Version::Fix44,
+        &config(
+            Response::PartialFill,
+            Response::PartialFill,
+            Response::Manual,
+        ),
+    );
+    let terms: &[(u32, &[u8])] = &[
+        (55, b"DEMO"),
+        (54, b"1"),
+        (38, b"10"),
+        (40, b"2"),
+        (44, b"12"),
+        (110, b"5"),
+    ];
+    f.wire
+        .send(b"D", 2, &[&[(11, b"min-new".as_slice())], terms].concat());
+    f.silent(3, 2);
+    f.expect_manual("2", "MinQty (110)");
+
+    request(&mut f.wire, b"D", 4, b"new", b"", b"10", b"12");
+    f.expect(b"8", 3, &[(150, b"0")]);
+    f.expect(b"8", 4, &[(150, b"F"), (32, b"2.5")]);
+    f.wire.send(
+        b"G",
+        5,
+        &[&[(11, b"min-replace".as_slice()), (41, b"new")], terms].concat(),
+    );
+    f.silent(6, 5);
+    f.expect_manual("5", "MinQty (110)");
+}
+
+#[test]
+fn strike_currency_is_reported_and_cannot_change_on_replace() {
+    let mut f = Fixture::start(
+        Role::Acceptor,
+        Version::Fix44,
+        &config(
+            Response::Acknowledge,
+            Response::Acknowledge,
+            Response::Manual,
+        ),
+    );
+    let terms: &[(u32, &[u8])] = &[
+        (55, b"DEMO"),
+        (54, b"1"),
+        (38, b"10"),
+        (40, b"2"),
+        (44, b"12"),
+        (202, b"10"),
+    ];
+    f.wire.send(
+        b"D",
+        2,
+        &[&[(11, b"new".as_slice()), (947, b"USD")], terms].concat(),
+    );
+    f.expect(b"8", 2, &[(150, b"0"), (947, b"USD")]);
+
+    f.wire.send(
+        b"G",
+        3,
+        &[
+            &[(11, b"changed".as_slice()), (41, b"new"), (947, b"EUR")],
+            terms,
+        ]
+        .concat(),
+    );
+    f.silent(4, 3);
+    f.expect_manual("3", "The instrument, currency, or side does not match");
+    f.wire.send(
+        b"G",
+        5,
+        &[
+            &[(11, b"same".as_slice()), (41, b"new"), (947, b"USD")],
+            terms,
+        ]
+        .concat(),
+    );
+    f.expect(b"8", 4, &[(150, b"5"), (11, b"same"), (947, b"USD")]);
+}
+
+#[test]
+fn replace_below_cum_qty_closes_the_chain_without_an_extra_trade() {
+    for version in Version::ALL {
+        for rule in [
+            Response::Acknowledge,
+            Response::PartialFill,
+            Response::FullFill,
+        ] {
+            let mut f = Fixture::start(
+                Role::Acceptor,
+                version,
+                &config(Response::PartialFill, rule, Response::Acknowledge),
+            );
+            request(&mut f.wire, b"D", 2, b"new", b"", b"10", b"12");
+            let id = order_id(&f.expect(b"8", 2, &[(150, b"0")]));
+            f.expect(b"8", 3, &[(39, b"1"), (14, b"2.5")]);
+            request(&mut f.wire, b"G", 3, b"replace", b"new", b"1", b"13");
+            f.expect(
+                b"8",
+                4,
+                &[
+                    (150, b"5"),
+                    (39, b"2"),
+                    (37, &id),
+                    (11, b"replace"),
+                    (41, b"new"),
+                    (38, b"2.5"),
+                    (14, b"2.5"),
+                    (151, b"0"),
+                    (6, b"12"),
+                ],
+            );
+            request(&mut f.wire, b"F", 4, b"cancel", b"replace", b"2.5", b"");
+            f.silent(5, 5);
+            f.expect_manual("4", "no live automated order");
+        }
+    }
+}
+
+#[test]
+fn leading_dot_quantity_and_price_fill_on_the_wire() {
+    let mut settings = config(Response::PartialFill, Response::Manual, Response::Manual);
+    ".125".clone_into(&mut settings.rules[0].quantity);
+    let mut f = Fixture::start(Role::Acceptor, Version::Fix44, &settings);
+    request(&mut f.wire, b"D", 2, b"fraction", b"", b".5", b".25");
+    f.expect(b"8", 2, &[(150, b"0"), (151, b"0.5")]);
+    f.expect(
+        b"8",
+        3,
+        &[
+            (150, b"F"),
+            (32, b"0.125"),
+            (31, b"0.25"),
+            (14, b"0.125"),
+            (151, b"0.375"),
+        ],
+    );
 }
