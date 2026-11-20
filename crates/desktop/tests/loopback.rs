@@ -463,3 +463,124 @@ fn checksum_error_preserves_the_following_frame_and_requests_recovery() {
     assert_eq!(rows[0].status, "Invalid frame");
     assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 4);
 }
+
+#[test]
+fn grouped_orders_send_versioned_counts_and_entries() {
+    use fixtester_desktop::model::grouped::{BidType, Contract, GroupedOrder, Leg, Side};
+
+    for version in Version::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = reserve();
+        let profile = profile(Role::Initiator, version, listener.local_addr().unwrap(), 1);
+        let (_, store, saved) = setup(dir.path(), profile);
+        let mut sessions = Sessions::default();
+        sessions.start(&store, saved.clone()).unwrap();
+        let mut peer = connect(&sessions, &saved, Some(&listener));
+        handshake(&sessions, saved.id, &mut peer, 1, 1, false);
+
+        let orders = ["ALPHA", "BETA"].map(|symbol| OrderValues {
+            symbol: symbol.into(),
+            quantity: "10".into(),
+            price: "5.50".into(),
+            ..OrderValues::default()
+        });
+        sessions
+            .send(
+                saved.id,
+                Send::GroupedOrder(GroupedOrder::List {
+                    bid_type: BidType::Disclosed,
+                    orders: orders.into(),
+                }),
+            )
+            .unwrap();
+
+        let raw = peer.receive(b"E", 2);
+        let mut decoder = Decoder::new(256);
+        let list = decoder.decode(&raw).unwrap().fields();
+        assert_eq!(list.get(394), Some(&b"2"[..]));
+        assert_eq!(list.get_u64(68), Some(2));
+        let definition = version.dictionary().message("E").unwrap().body.groups[0];
+        let group = list.group(definition).unwrap().unwrap();
+        assert_eq!(group.len(), 2);
+        let mut entries = group.entries();
+        let first = entries.next().unwrap();
+        let second = entries.next().unwrap();
+        assert_ne!(first.get(11).unwrap(), second.get(11).unwrap());
+        for (entry, number, symbol) in [
+            (first, 1, b"ALPHA".as_slice()),
+            (second, 2, b"BETA".as_slice()),
+        ] {
+            assert_eq!(entry.get_u64(67), Some(number));
+            assert_eq!(entry.get(55), Some(symbol));
+            assert_eq!(entry.get(40), Some(&b"2"[..]));
+            assert_eq!(entry.get(44), Some(&b"5.50"[..]));
+            assert_eq!(
+                entry.get(21),
+                (version != Version::Fix44).then_some(&b"1"[..])
+            );
+        }
+
+        let multileg = GroupedOrder::Multileg {
+            symbol: "DEMO-SPREAD".into(),
+            quantity: "5".into(),
+            price: "-0.25".into(),
+            legs: [
+                (Contract::Future, "FUT-Z", Side::Buy, ""),
+                (Contract::Call, "OPT-C", Side::Sell, "100"),
+                (Contract::Put, "OPT-P", Side::Buy, "95"),
+            ]
+            .map(|(contract, symbol, side, strike)| Leg {
+                contract,
+                symbol: symbol.into(),
+                side,
+                strike: strike.into(),
+                maturity: "202712".into(),
+                ratio: "1".into(),
+            })
+            .into(),
+        };
+        sessions
+            .send(saved.id, Send::GroupedOrder(multileg))
+            .unwrap();
+        if version == Version::Fix42 {
+            wait(|| {
+                sessions
+                    .status(saved.id)
+                    .is_some_and(|state| state.send_error.is_some())
+            });
+            assert_eq!(store.checkpoint(saved.id).unwrap().seq.next_sender, 3);
+        } else {
+            let raw = peer.receive(b"AB", 3);
+            let order = decoder.decode(&raw).unwrap().fields();
+            assert_eq!(order.get(54), Some(&b"B"[..]));
+            assert_eq!(order.get(44), Some(&b"-0.25"[..]));
+            assert_eq!(
+                order.get(21),
+                (version == Version::Fix43).then_some(&b"1"[..])
+            );
+            let definition = version
+                .dictionary()
+                .message("AB")
+                .unwrap()
+                .body
+                .groups
+                .iter()
+                .find(|group| group.count_tag == 555)
+                .unwrap();
+            let group = order.group(definition).unwrap().unwrap();
+            assert_eq!(group.len(), 3);
+            let mut legs = group.entries();
+            let future = legs.next().unwrap();
+            assert_eq!(future.get(609), Some(&b"FUT"[..]));
+            assert_eq!(future.get(612), None);
+            let call = legs.next().unwrap();
+            assert_eq!(call.get(608), Some(&b"OCXXXX"[..]));
+            assert_eq!(call.get(612), Some(&b"100"[..]));
+            assert_eq!(call.get(624), Some(&b"2"[..]));
+            let put = legs.next().unwrap();
+            assert_eq!(put.get(608), Some(&b"OPXXXX"[..]));
+            assert_eq!(put.get(612), Some(&b"95"[..]));
+            assert_eq!(put.get(610), Some(&b"202712"[..]));
+        }
+    }
+}

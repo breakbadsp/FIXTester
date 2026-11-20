@@ -65,6 +65,18 @@ OrigClOrdID is read-only when the form comes from a sent order.
 Select **Enter original details manually** to clear the copied fields and
 start a blank draft. Enter OrigClOrdID and the order fields. FIXTester generates each new ClOrdID.
 
+Select **Multileg order** on a FIX 4.3 or 4.4 session to send `35=AB`.
+Enter the strategy symbol, quantity, and net limit price. Add 2 to 16
+legs. Each leg has a symbol, maturity, side, and ratio. Select Future,
+Call, or Put. Calls and puts also require a strike. Enter maturity as
+`YYYYMM`, `YYYYMMDD`, or `YYYYMMwN`. The sides of the legs define the
+strategy direction.
+
+Select **Order list** on any supported FIX version to send `35=E`.
+Select the bid type and enter 1 to 16 single Limit orders. FIXTester
+assigns the list ID, the order IDs, and the group counts. Use the tag
+editor when a venue requires fields outside these dialogs.
+
 The tag editor accepts an application MsgType, such as `8` for an
 Execution Report, and one `Tag=Value` per line. It accepts custom tags
 and application MsgTypes. It handles the standard header, framing, and

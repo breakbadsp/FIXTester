@@ -172,8 +172,7 @@ fn workspace_price_only_replace_keeps_selected_instructions() {
     order_flow(true);
 }
 
-fn order_flow(from_tags: bool) {
-    let dir = tempfile::tempdir().unwrap();
+fn connected_workspace(path: &Path) -> (Driver, Wire) {
     let addr = TcpListener::bind("127.0.0.1:0").unwrap();
     let profile = Profile {
         name: "Loopback example".into(),
@@ -184,7 +183,7 @@ fn order_flow(from_tags: bool) {
         address: addr.local_addr().unwrap(),
         heartbeat: 30,
     };
-    let mut ui = Driver::new(&dir.path().join("workspace.db"));
+    let mut ui = Driver::new(path);
     ui.click("Add profile");
     ui.enter("Name", &profile.name);
     ui.enter("SenderCompID", &profile.sender);
@@ -212,6 +211,45 @@ fn order_flow(from_tags: bool) {
     peer.receive(b"A", 1);
     peer.logon(1, false);
     ui.wait_for(accesskit::Role::Label, "Logon complete.");
+    (ui, peer)
+}
+
+#[test]
+fn workspace_sends_a_multileg_order_and_an_order_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("grouped.db"));
+
+    ui.click("Multileg order");
+    ui.enter("Strategy symbol", "FUT-SPREAD");
+    ui.enter("Strategy quantity", "1");
+    ui.enter("Net limit price", "-0.25");
+    ui.enter("Leg 1 symbol", "FUT-Z");
+    ui.enter("Leg 1 maturity", "202712");
+    ui.enter("Leg 2 symbol", "FUT-H");
+    ui.enter("Leg 2 maturity", "202803");
+    ui.click("Send");
+
+    let raw = peer.receive(b"AB", 2);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    assert_eq!(fields.get_u64(555), Some(2));
+    assert_eq!(fields.get(44), Some(b"-0.25".as_slice()));
+    ui.click("Order list");
+    ui.enter("Symbol", "ALPHA");
+    ui.enter("Quantity", "12");
+    ui.enter("Limit price", "19.50");
+    ui.click("Send");
+
+    let raw = peer.receive(b"E", 3);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    assert_eq!(fields.get_u64(73), Some(1));
+    assert_eq!(fields.get(55), Some(b"ALPHA".as_slice()));
+    assert_eq!(fields.get(44), Some(b"19.50".as_slice()));
+}
+
+fn order_flow(from_tags: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("workspace.db"));
 
     if from_tags {
         ui.key(Key::T, Modifiers::CTRL);

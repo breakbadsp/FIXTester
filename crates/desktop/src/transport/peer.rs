@@ -241,6 +241,13 @@ impl Peer<'_> {
             Send::Tags(_) => Err(invalid(
                 "Build the application message for the selected FIX version.",
             )),
+            Send::GroupedOrder(order) => {
+                let id = self.store.next_order_id(time)?;
+                Ok((
+                    order.application(self.saved.profile.version, id, time)?,
+                    None,
+                ))
+            }
             Send::Order(order) => {
                 order.validate()?;
                 let id = self.store.next_order_id(time)?;
