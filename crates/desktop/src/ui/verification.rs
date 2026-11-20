@@ -223,6 +223,7 @@ fn workspace_sends_a_multileg_order_and_an_order_list() {
     ui.enter("Strategy symbol", "FUT-SPREAD");
     ui.enter("Strategy quantity", "1");
     ui.enter("Net limit price", "-0.25");
+    ui.enter("Strategy CFI override", "FMXXXX");
     ui.enter("Leg 1 symbol", "FUT-Z");
     ui.enter("Leg 1 maturity", "202712");
     ui.enter("Leg 2 symbol", "FUT-H");
@@ -233,7 +234,7 @@ fn workspace_sends_a_multileg_order_and_an_order_list() {
     let mut decoder = Decoder::new(256);
     let fields = decoder.decode(&raw).unwrap().fields();
     assert_eq!(fields.get_u64(555), Some(2));
-    assert_eq!(fields.get(461), Some(b"FXXXXS".as_slice()));
+    assert_eq!(fields.get(461), Some(b"FMXXXX".as_slice()));
     assert_eq!(fields.get(44), Some(b"-0.25".as_slice()));
     ui.click("Order list");
     ui.enter("Symbol", "ALPHA");

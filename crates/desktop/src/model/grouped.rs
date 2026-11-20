@@ -137,11 +137,12 @@ impl MultilegOrder {
         if price.len() > 24 || !matches_type(FieldType::Price, price.as_bytes()) {
             return Err(invalid("Enter a decimal net limit price."));
         }
+        // FIX 4.3 and 4.4 Volume 7, page 27, specify FMXXS (five letters) and OMXXXN.
         let cfi = if cfi.is_empty() {
             if legs.iter().all(|leg| leg.contract == Contract::Future) {
-                "FXXXXS"
+                "FMXXS"
             } else {
-                "OMXXXS"
+                "OMXXXN"
             }
         } else if cfi.len() == 6 && cfi.bytes().all(|byte| byte.is_ascii_uppercase()) {
             cfi

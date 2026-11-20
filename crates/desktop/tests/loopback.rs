@@ -529,7 +529,7 @@ fn grouped_orders_send_versioned_counts_and_entries() {
             assert_eq!(entry.iter().collect::<Vec<_>>(), expected);
         }
 
-        let multileg = GroupedOrder::Multileg(MultilegOrder {
+        let mut multileg = MultilegOrder {
             symbol: "DEMO-SPREAD".into(),
             quantity: "5".into(),
             price: "-0.25".into(),
@@ -548,9 +548,12 @@ fn grouped_orders_send_versioned_counts_and_entries() {
                 ratio: "2".into(),
             })
             .into(),
-        });
+        };
         sessions
-            .send(saved.id, Send::GroupedOrder(multileg))
+            .send(
+                saved.id,
+                Send::GroupedOrder(GroupedOrder::Multileg(multileg.clone())),
+            )
             .unwrap();
         if version == Version::Fix42 {
             wait(|| {
@@ -580,7 +583,7 @@ fn grouped_orders_send_versioned_counts_and_entries() {
             let group = order.group(definition).unwrap().unwrap();
             assert_eq!(group.len(), 3);
             assert_eq!(order.get(167), Some(b"MLEG".as_slice()));
-            assert_eq!(order.get(461), Some(b"OMXXXS".as_slice()));
+            assert_eq!(order.get(461), Some(b"OMXXXN".as_slice()));
             let expected_legs: [ExpectedLeg<'_>; 3] = [
                 (b"FUT-Z", b"FXXXXX", b"FUT", b"202712", None, b"1"),
                 (b"OPT-C", b"OCXXXX", b"OPT", b"20271217", Some(b"100"), b"2"),
@@ -605,6 +608,19 @@ fn grouped_orders_send_versioned_counts_and_entries() {
                 expected.extend([(623, b"2".as_slice()), (624, side)]);
                 assert_eq!(leg.iter().collect::<Vec<_>>(), expected);
             }
+
+            multileg.legs = vec![multileg.legs[0].clone(); 2];
+            multileg.legs[1].side = Side::Sell;
+            sessions
+                .send(
+                    saved.id,
+                    Send::GroupedOrder(GroupedOrder::Multileg(multileg)),
+                )
+                .unwrap();
+            let raw = peer.receive(b"AB", 4);
+            let order = decoder.decode(&raw).unwrap().fields();
+            assert_eq!(order.get(461), Some(b"FMXXS".as_slice()));
+            assert_eq!(order.get_u64(555), Some(2));
         }
     }
 }
