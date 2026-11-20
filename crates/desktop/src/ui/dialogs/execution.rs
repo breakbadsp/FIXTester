@@ -134,9 +134,6 @@ impl Workspace {
             .max_height(height)
             .show(ui, |ui| {
                 report_fields(ui, &mut draft.report, false);
-                if let Some(value) = draft.report.reference_fill_type() {
-                    referenced_fill_type(ui, value);
-                }
                 additional::show(ui, &mut draft.additional, &mut self.notice);
                 egui::CollapsingHeader::new("Additional FIX fields").show(ui, |ui| {
                     report_fields(ui, &mut draft.report, true);
@@ -167,24 +164,6 @@ impl Workspace {
         }
         true
     }
-}
-
-fn referenced_fill_type(ui: &mut egui::Ui, value: &mut String) {
-    ui.horizontal(|ui| {
-        let label = ui.label("Referenced fill type");
-        egui::ComboBox::from_id_salt("reference-fill-type")
-            .selected_text(match value.as_str() {
-                "1" => "Partial fill",
-                "2" => "Full fill",
-                _ => "Select a fill type",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(value, "1".into(), "Partial fill");
-                ui.selectable_value(value, "2".into(), "Full fill");
-            })
-            .response
-            .labelled_by(label.id);
-    });
 }
 
 fn report_fields(ui: &mut egui::Ui, report: &mut Report, detail: bool) {

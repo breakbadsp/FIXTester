@@ -717,22 +717,36 @@ fn execution_status_echoes_the_status_request_id() {
 }
 
 #[test]
-fn fix42_correction_uses_resulting_fill_type_and_original_exec_ref() {
+fn fix42_correction_and_bust_use_resulting_fill_type_and_exec_ref() {
     let dir = tempfile::tempdir().unwrap();
     let (mut ui, mut peer) =
         connected_workspace_version(&dir.path().join("fix42-correction.db"), Version::Fix42);
-    ui.key(Key::T, Modifiers::CTRL);
-    ui.enter("MsgType", "8");
-    let editor = ui.wait_for(
-        accesskit::Role::MultilineTextInput,
-        "One Tag=Value pair per line.",
+    peer.send(
+        b"D",
+        2,
+        &[(11, b"ORDER"), (55, b"XYZ"), (54, b"1"), (38, b"10")],
     );
-    ui.action(editor, accesskit::Action::Focus);
-    ui.frame(vec![Event::Paste(
-        "37=VENUE\n11=ORDER\n17=FILL-OLD\n20=0\n150=2\n39=2\n55=XYZ\n54=1\n38=10\n32=9\n31=110\n151=0\n14=10\n6=109".into(),
-    )], Modifiers::NONE);
+    ui.click("OrderSingle");
+    ui.click("Execution actions");
+    ui.click("Full fill");
+    ui.enter("CumQty", "9.99999999999999999");
+    ui.enter("AvgPx", "109");
+    ui.enter("LastShares", "9");
+    ui.enter("LastPx", "110");
     ui.click("Send");
-    peer.receive(b"8", 2);
+    ui.wait_for(
+        accesskit::Role::Label,
+        "A full fill requires CumQty to equal OrderQty.",
+    );
+    ui.enter("CumQty", "10.000");
+    ui.click("Send");
+    let raw = peer.receive(b"8", 2);
+    let mut decoder = Decoder::new(256);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    let full_id = fields.get(17).unwrap().to_vec();
+    assert_eq!(fields.get(150), Some(b"2".as_slice()));
+    assert_eq!(fields.get(14), Some(b"10.000".as_slice()));
+    assert_eq!(fields.get(151), Some(b"0".as_slice()));
     ui.wait_for_workspace();
 
     ui.click("ExecutionReport");
@@ -747,15 +761,36 @@ fn fix42_correction_uses_resulting_fill_type_and_original_exec_ref() {
     ui.click("Send");
 
     let raw = peer.receive(b"8", 3);
-    let mut decoder = Decoder::new(256);
     let fields = decoder.decode(&raw).unwrap().fields();
     for (tag, value) in [
         (20, b"2".as_slice()),
         (150, b"1"),
         (39, b"1"),
-        (19, b"FILL-OLD"),
+        (19, full_id.as_slice()),
         (14, b"9"),
         (151, b"1"),
+    ] {
+        assert_eq!(fields.get(tag), Some(value));
+    }
+    let correction_id = fields.get(17).unwrap().to_vec();
+    ui.wait_for_workspace();
+    ui.click("ExecutionReport");
+    ui.click("Execution actions");
+    ui.click("Trade bust");
+    choose_status(&mut ui, "4 · Canceled");
+    ui.enter("CumQty", "0");
+    ui.enter("LeavesQty", "0");
+    ui.enter("AvgPx", "0");
+    ui.click("Send");
+    let raw = peer.receive(b"8", 4);
+    let fields = decoder.decode(&raw).unwrap().fields();
+    for (tag, value) in [
+        (20, b"1".as_slice()),
+        (150, b"1"),
+        (39, b"4"),
+        (19, correction_id.as_slice()),
+        (31, b"0"),
+        (32, b"0"),
     ] {
         assert_eq!(fields.get(tag), Some(value));
     }

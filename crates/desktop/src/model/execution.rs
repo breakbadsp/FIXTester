@@ -26,7 +26,6 @@ pub struct Report {
     fields: Vec<ReportField>,
     groups: Vec<(u32, String)>,
     multileg: bool,
-    reference_type: String,
 }
 
 impl Report {
@@ -43,11 +42,6 @@ impl Report {
             fields: Vec::new(),
             groups: Vec::new(),
             multileg: order.value(442) == "3" || (order.multileg && order.value(442) != "2"),
-            reference_type: if context.source == Source::Trade {
-                order.value(150).to_owned()
-            } else {
-                String::new()
-            },
         };
         let order_id = if context.source.assigns_order_id() {
             context.order_id(child)
@@ -182,11 +176,6 @@ impl Report {
         self.version
     }
 
-    pub fn reference_fill_type(&mut self) -> Option<&mut String> {
-        (self.version == Version::Fix42 && self.action == Action::Bust)
-            .then_some(&mut self.reference_type)
-    }
-
     fn value(&self, tag: u32) -> &str {
         self.fields
             .iter()
@@ -250,12 +239,6 @@ impl Report {
         if self.action == Action::PartialFill && !nonzero(self.value(151)) {
             return Err(invalid("A partial fill requires positive LeavesQty."));
         }
-        if self.version == Version::Fix42
-            && self.action == Action::Bust
-            && !matches!(self.reference_type.as_str(), "1" | "2")
-        {
-            return Err(invalid("Select the type of the referenced FIX 4.2 fill."));
-        }
         Ok(())
     }
 
@@ -263,23 +246,17 @@ impl Report {
         decimal_parts(self.value(14)) == decimal_parts(self.value(38))
     }
 
-    fn execution_type(&self) -> Result<String> {
+    fn execution_type(&self) -> String {
         let status = self.value(39);
-        if self.version == Version::Fix42 && self.action == Action::Correct {
-            // Appendix D34 uses the fill type after the correction.
-            if !self.value(38).is_empty() {
-                return Ok(if self.order_filled() { "2" } else { "1" }.into());
-            }
-            if matches!(status, "1" | "2") {
-                return Ok(status.into());
-            }
-            return Err(invalid(
-                "Enter OrderQty to determine the corrected fill type.",
-            ));
-        }
-        Ok(self
-            .action
-            .exec_type(self.version, status, &self.reference_type))
+        // Appendix D34 uses the resulting fill type. D35 keeps a partial fill
+        // type when the canceled order status takes precedence.
+        let fill_type = match status {
+            "0" if self.action == Action::Bust => "0",
+            "1" | "2" => status,
+            _ if !self.value(38).is_empty() && self.order_filled() => "2",
+            _ => "1",
+        };
+        self.action.exec_type(self.version, status, fill_type)
     }
 
     pub(crate) fn application(&self, time: UtcMillis, exec_id: String) -> Result<Application> {
@@ -295,7 +272,7 @@ impl Report {
             fields.push((434, response_to.into()));
         } else {
             fields.push((17, exec_id));
-            fields.push((150, self.execution_type()?));
+            fields.push((150, self.execution_type()));
             if self.version == Version::Fix42 {
                 fields.push((20, action.transaction().into()));
                 if action != Action::Status {

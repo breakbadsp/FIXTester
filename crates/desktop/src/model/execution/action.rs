@@ -120,11 +120,11 @@ impl Action {
         }
     }
 
-    pub(super) fn exec_type(self, version: Version, status: &str, reference_type: &str) -> String {
+    pub(super) fn exec_type(self, version: Version, status: &str, fill_type: &str) -> String {
         match self {
             Restate => "D",
             Replace => "5",
-            Bust if version == Version::Fix42 => reference_type,
+            Correct | Bust if version == Version::Fix42 => fill_type,
             Status if version == Version::Fix42 => status,
             PartialFill | FullFill if version != Version::Fix42 => "F",
             Correct => "G",
