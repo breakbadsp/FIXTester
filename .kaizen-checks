@@ -1,0 +1,7 @@
+# name	globs	command
+@all	.kaizen-checks .github/* Cargo.toml Cargo.lock rust-toolchain.toml
+@skip	README.md LICENSES/*
+workspace	crates/* clippy.toml rustfmt.toml tools/*	cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked
+send-durability	crates/desktop/src/store.rs crates/desktop/src/store/* crates/desktop/src/schema.sql crates/desktop/src/transport.rs crates/desktop/src/transport/* crates/desktop/tests/* crates/fix-session/* crates/fix-codec/* verification/send-durability/* .claude/skills/verify-fix-session/* tools/check-tla.sh	tools/check-tla.sh verification/send-durability/SendDurability.tla
+session-recovery	crates/fix-session/* crates/fix-codec/* crates/fix-sim/* verification/session-recovery/* .claude/skills/verify-fix-session/* tools/check-tla.sh	tools/check-tla.sh verification/session-recovery/SessionRecovery.tla
+wire-fuzz	crates/fix-codec/* fuzz/* tools/fuzz-wire.sh	tools/fuzz-wire.sh

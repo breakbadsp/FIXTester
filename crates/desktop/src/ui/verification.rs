@@ -174,6 +174,36 @@ fn workspace_new_report_replace_and_cancel() {
 }
 
 #[test]
+fn an_open_order_draft_keeps_its_original_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut peer) = connected_workspace(&dir.path().join("test.db"));
+    let second = Profile {
+        name: "Second profile".into(),
+        sender: "OTHER".into(),
+        ..peer.profile.clone()
+    };
+    let second_id = ui.workspace.store.save_profile(None, &second).unwrap();
+    ui.workspace.profiles = ui.workspace.store.profiles().unwrap();
+
+    ui.key(Key::N, Modifiers::CTRL);
+    ui.enter("Symbol", "ORIGINAL");
+    ui.enter("Quantity", "10");
+    ui.enter("Limit price", "12.50");
+    // Inject a selection update while the modal owns the user's input.
+    ui.workspace.select(second_id);
+    ui.click("Send");
+    let raw = peer.receive(b"D", 2);
+    ui.wait_for_workspace();
+    let mut decoder = Decoder::new(256);
+    assert_eq!(
+        decoder.decode(&raw).unwrap().fields().get(55),
+        Some(b"ORIGINAL".as_slice())
+    );
+    assert_eq!(ui.workspace.selected, Some(second_id));
+    ui.wait_for(accesskit::Role::Button, "Connect");
+}
+
+#[test]
 fn workspace_price_only_replace_keeps_selected_instructions() {
     order_flow(true);
 }

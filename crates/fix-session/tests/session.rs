@@ -706,6 +706,48 @@ fn sequence_reset_to_a_lower_number_is_rejected_with_value_incorrect() {
 // ---- Sequence too low ----
 
 #[test]
+fn receive_recovery_rejects_jumps_across_disconnect_and_reconnect() {
+    let mut session = active_initiator(V44);
+    assert_eq!(
+        feed(&mut session, T0, &app_order(5, T0, "AHEAD")),
+        Disposition::Drop
+    );
+    assert_eq!(session.sequence_numbers().next_target, 2);
+    assert_eq!(
+        feed(&mut session, T0, &from_peer("4", 5, T0, &[])),
+        Disposition::Drop
+    );
+    assert_eq!(session.sequence_numbers().next_target, 2);
+    assert_eq!(
+        feed(&mut session, T0, &from_peer("4", 2, T0, &[(123, "Y")])),
+        Disposition::Drop
+    );
+    assert_eq!(session.sequence_numbers().next_target, 3);
+
+    session.on_disconnected(T0);
+    session.on_connected(T0);
+    assert_eq!(
+        feed(&mut session, T0, &app_order(3, T0, "BEFORE-LOGON")),
+        Disposition::Drop
+    );
+    assert_eq!(session.sequence_numbers().next_target, 3);
+
+    session.on_disconnected(T0);
+    session.on_connected(T0);
+    feed(&mut session, T0, &logon_reply(V44, 4, "30"));
+    assert_eq!(session.state(), State::Active);
+    assert_eq!(
+        feed(&mut session, T0, &app_order(5, T0, "STILL-AHEAD")),
+        Disposition::Drop
+    );
+    assert_eq!(
+        feed(&mut session, T0, &app_order(3, T0, "RECOVERED")),
+        Disposition::Deliver
+    );
+    assert_eq!(session.sequence_numbers().next_target, 4);
+}
+
+#[test]
 fn sequence_too_low_without_poss_dup_logs_out_with_text_and_disconnects() {
     let mut session = active_initiator_at(4);
     let now = UtcMillis(T0.0 + 1_000);
