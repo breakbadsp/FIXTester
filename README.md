@@ -260,9 +260,15 @@ Wayland or X11 libraries.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+tools/check-tla.sh verification/send-durability/SendDurability.tla
+tools/check-tla.sh verification/session-recovery/SessionRecovery.tla
+tools/fuzz-wire.sh
 tools/native-smoke.sh alma /tmp/fixtester
 tools/native-smoke.sh host /tmp/fixtester
 ```
+
+The model checks need Java 11 or later. The
+[proof plan](verification/README.md) lists the checks by component.
 
 The workspace tests include real loopback TCP for both roles, all three
 versions, eight simultaneous sessions, restart, reset, gaps, and

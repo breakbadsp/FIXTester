@@ -1119,6 +1119,7 @@ dependencies = [
  "fix-codec",
  "fix-dict",
  "fix-session",
+ "proptest",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.21",

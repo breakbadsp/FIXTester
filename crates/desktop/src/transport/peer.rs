@@ -516,6 +516,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+
     use crate::model::Profile;
     use crate::store::Filter;
     use fix_dict::Version;
@@ -537,6 +540,54 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn failed_reservation_sends_no_logon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut store = Store::open(&path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let profile = Profile {
+            name: "Failed Logon reservation".into(),
+            version: Version::Fix44,
+            role: Role::Initiator,
+            sender: "TEST".into(),
+            target: "PEER".into(),
+            address: listener.local_addr().unwrap(),
+            heartbeat: 30,
+        };
+        let id = store.save_profile(None, &profile).unwrap();
+        let database = rusqlite::Connection::open(path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TRIGGER fail_reservation BEFORE INSERT ON history
+                 BEGIN SELECT raise(ABORT, 'test reservation failure'); END;",
+            )
+            .unwrap();
+        let stream = TcpStream::connect(profile.address).unwrap();
+        let (mut other, _) = listener.accept().unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (_commands, receiver) = mpsc::channel();
+        let control = Control {
+            stop: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(super::super::Status::default())),
+            commands: receiver,
+            rules: None,
+        };
+        let error =
+            connect(stream, &mut store, &SavedProfile { id, profile }, &control).unwrap_err();
+        assert!(error.to_string().contains("test reservation failure"));
+        assert_eq!(other.read(&mut [0]).unwrap(), 0, "Logon reached TCP");
+        assert_eq!(store.checkpoint(id).unwrap().seq.next_sender, 1);
+        assert!(
+            store
+                .history(id, &Filter::default(), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

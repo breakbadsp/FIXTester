@@ -1,0 +1,21 @@
+[package]
+name = "fixtester-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+fix-codec = { path = "../crates/fix-codec" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

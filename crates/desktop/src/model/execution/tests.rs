@@ -1,21 +1,27 @@
 #![allow(clippy::unwrap_used)]
 
-use fix_codec::Encoder;
+use fix_codec::{Decoder, Encoder};
+use proptest::prelude::*;
 
+use super::automation::{Automation, Response, Rule, Settings};
 use super::*;
 use crate::store::{Direction, Entry};
 
-fn received(version: Version, kind: &str, body: &[(u32, &str)]) -> Context {
+fn test_frame(version: Version, kind: &str, body: &[(u32, &str)]) -> Vec<u8> {
     let mut encoder = Encoder::new(1024);
     let mut message = encoder.start(kind.as_bytes());
     message.field(34, b"1");
     for (tag, value) in body {
         message.field(*tag, value.as_bytes());
     }
-    let raw = message
+    message
         .finish(version.begin_string().as_bytes())
         .unwrap()
-        .to_vec();
+        .to_vec()
+}
+
+fn received(version: Version, kind: &str, body: &[(u32, &str)]) -> Context {
+    let raw = test_frame(version, kind, body);
     Context::read(
         version,
         &Entry {
@@ -31,6 +37,88 @@ fn received(version: Version, kind: &str, body: &[(u32, &str)]) -> Context {
         },
     )
     .unwrap()
+}
+
+proptest! {
+    #[test]
+    fn automated_order_chains_preserve_quantities_and_reject_stale_references(
+        version in prop::sample::select(vec![Version::Fix42, Version::Fix43, Version::Fix44]),
+        initial in 2u64..50,
+        replacements in prop::collection::vec(1u64..30, 1..12),
+    ) {
+        let partial = Rule {
+            response: Response::PartialFill,
+            quantity: "1".into(),
+            ..Rule::default()
+        };
+        let rules = Settings {
+            enabled: true,
+            rules: [partial.clone(), partial, Rule {
+                response: Response::FullFill,
+                ..Rule::default()
+            }],
+        }.compile().unwrap().unwrap();
+        let mut automation = Automation::new(&rules);
+        let mut decoder = Decoder::new(64);
+        let mut current = "NEW".to_owned();
+        let mut quantity = initial;
+        let mut filled = 1;
+        let raw = test_frame(version, "D", &[
+            (11, &current), (55, "XYZ"), (54, "1"), (38, &initial.to_string()),
+            (40, "2"), (44, "12"),
+        ]);
+        let message = decoder.decode(&raw).unwrap();
+        let plan = automation.plan(version, &message, || Ok("ORDER".into())).unwrap().unwrap();
+        prop_assert_eq!(plan.reports.len(), 2);
+        prop_assert_eq!(plan.reports[1].value(14), "1");
+        prop_assert_eq!(plan.reports[1].value(151), (initial - 1).to_string());
+        automation.apply(plan);
+
+        for (index, amount) in replacements.into_iter().enumerate() {
+            let next = format!("REPLACE-{index}");
+            let requested = if amount <= filled { amount } else { filled + amount + 2 };
+            let raw = test_frame(version, "G", &[
+                (11, &next), (41, &current), (37, "ORDER"), (55, "XYZ"), (54, "1"),
+                (38, &requested.to_string()), (40, "2"), (44, "12"),
+            ]);
+            let message = decoder.decode(&raw).unwrap();
+            let plan = automation.plan(version, &message, || Ok("unused".into())).unwrap().unwrap();
+            let closed = requested <= filled;
+            quantity = requested.max(filled);
+            prop_assert_eq!(plan.reports.len(), if closed { 1 } else { 2 });
+            if !closed {
+                filled += 1;
+            }
+            let report = plan.reports.last().unwrap();
+            prop_assert_eq!(report.value(38), quantity.to_string());
+            prop_assert_eq!(report.value(14), filled.to_string());
+            prop_assert_eq!(report.value(151), (quantity - filled).to_string());
+            automation.apply(plan);
+            let stale = test_frame(version, "F", &[
+                (11, &format!("STALE-{index}")), (41, &current), (54, "1"), (55, "XYZ"),
+            ]);
+            let message = decoder.decode(&stale).unwrap();
+            prop_assert!(automation.plan(version, &message, || Ok("unused".into())).is_err());
+            current = next;
+            if closed {
+                break;
+            }
+        }
+
+        let raw = test_frame(version, "F", &[(11, "CANCEL"), (41, &current), (54, "1"), (55, "XYZ")]);
+        let message = decoder.decode(&raw).unwrap();
+        let plan = automation.plan(version, &message, || Ok("unused".into()));
+        if quantity == filled {
+            prop_assert!(plan.is_err());
+        } else {
+            let plan = plan.unwrap().unwrap();
+            prop_assert_eq!(plan.reports.len(), 2);
+            let trade = &plan.reports[0];
+            prop_assert_eq!(trade.value(32), (quantity - filled).to_string());
+            prop_assert_eq!(trade.value(14), quantity.to_string());
+            prop_assert_eq!(trade.value(151), "0");
+        }
+    }
 }
 
 fn fill_inputs(report: &mut Report) {

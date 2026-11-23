@@ -13,23 +13,19 @@ fn failures(options: Options) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn sessions_recover_from_every_fault_for_each_seed() {
-    let failures = failures(Options::default());
-    assert!(
-        failures.is_empty(),
-        "{} of {SEEDS} seeds failed:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
-}
-
 /// A run that never used a fault would pass for the wrong reason.
 #[test]
-fn the_runs_use_every_fault_and_both_sides_deliver_orders() {
+fn sessions_recover_across_seeds_that_exercise_every_fault() {
     let mut total = Report::default();
+    let mut failures = Vec::new();
     for seed in 0..SEEDS {
-        let report = run_seed(seed).unwrap();
+        let report = match run_seed(seed) {
+            Ok(report) => report,
+            Err(failure) => {
+                failures.push(failure.to_string());
+                continue;
+            }
+        };
         total.cuts += report.cuts;
         total.stalls += report.stalls;
         total.clock_steps += report.clock_steps;
@@ -43,6 +39,12 @@ fn the_runs_use_every_fault_and_both_sides_deliver_orders() {
             sum.logons += stats.logons;
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
     assert!(total.cuts > 0 && total.stalls > 0 && total.clock_steps > 0 && total.logouts > 0);
     assert!(total.duplicates > 0, "no duplicate was injected");
     assert!(

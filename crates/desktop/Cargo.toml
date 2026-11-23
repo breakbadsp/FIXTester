@@ -25,6 +25,9 @@ thiserror = "2"
 
 tempfile = "3"
 
+[dev-dependencies]
+proptest = "1"
+
 [[bin]]
 name = "fixtester"
 path = "src/main.rs"
