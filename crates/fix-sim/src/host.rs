@@ -6,10 +6,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use fix_codec::{Decoder, Encoder, UtcMillis, frame, tag, write_utc_timestamp};
-use fix_session::{Config, Disposition, Event, SendError, SequenceNumbers, Session, State};
+use fix_session::{
+    Config, Disposition, Event, SendError, SequenceNumbers, Session, SessionTime, State,
+};
 
 use crate::pipe::Pipe;
 use crate::rng::Rng;
+use crate::world::START;
 
 const FRAME_MAX: usize = 4096;
 const DECODER_FIELDS: usize = 64;
@@ -53,7 +56,8 @@ pub struct Stats {
 #[derive(Debug)]
 pub struct Host {
     pub session: Session,
-    /// The local clock is the simulation clock plus this offset.
+    /// The wall clock (UTC) of this side is the simulation clock plus this
+    /// offset. The elapsed clock of the timers has no offset.
     pub skew_ms: i64,
     pub connected: bool,
     /// The next outgoing message is lost before it reaches the wire.
@@ -94,8 +98,14 @@ impl Host {
         }
     }
 
-    pub fn local(&self, now: UtcMillis) -> UtcMillis {
-        UtcMillis(now.0.saturating_add_signed(self.skew_ms))
+    /// The two clocks of this side at the simulation time `now`. A clock
+    /// step changes the wall clock only, as an NTP or operator correction
+    /// does. The elapsed clock counts from [`START`] and never goes back.
+    pub fn time(&self, now: UtcMillis) -> SessionTime {
+        SessionTime {
+            elapsed_ms: now.0.saturating_sub(START.0),
+            utc: UtcMillis(now.0.saturating_add_signed(self.skew_ms)),
+        }
     }
 
     /// The simulation time of the next session timer, or `None`.
@@ -103,36 +113,36 @@ impl Host {
         if !self.connected {
             return None;
         }
-        let local = self.session.next_deadline()?;
-        Some(UtcMillis(local.0.saturating_add_signed(-self.skew_ms)))
+        let elapsed = self.session.next_deadline_ms()?;
+        Some(UtcMillis(START.0.saturating_add(elapsed)))
     }
 
     pub fn connect(&mut self, now: UtcMillis) {
         self.connected = true;
         self.recv.clear();
-        self.session.on_connected(self.local(now));
+        self.session.on_connected_at(self.time(now));
     }
 
     pub fn disconnect(&mut self, now: UtcMillis) {
         self.connected = false;
         self.recv.clear();
-        self.session.on_disconnected(self.local(now));
+        self.session.on_disconnected_at(self.time(now));
     }
 
     pub fn timer(&mut self, now: UtcMillis) {
-        self.session.on_timer(self.local(now));
+        self.session.on_timer_at(self.time(now));
     }
 
     pub fn logout(&mut self, now: UtcMillis) {
-        self.session.logout(self.local(now), b"sim logout");
+        self.session.logout_at(self.time(now), b"sim logout");
     }
 
     /// Sends one order. Returns the MsgSeqNum, or `None` when the session is
     /// not active. Checks that the session refuses exactly when not active.
     pub fn send_order(&mut self, now: UtcMillis, id: u64) -> Result<Option<u64>, String> {
-        let local = self.local(now);
+        let time = self.time(now);
         let active = self.session.state() == State::Active;
-        let result = self.session.send_app(local, NEW_ORDER, |body| {
+        let result = self.session.send_app_at(time, NEW_ORDER, |body| {
             body.field_u64(ORDER_TAG, id).field(55, b"SIM");
         });
         match (result, active) {
@@ -153,7 +163,7 @@ impl Host {
     /// message. Returns the messages that the session delivered.
     pub fn receive(&mut self, now: UtcMillis, bytes: &[u8]) -> Result<Vec<Delivered>, String> {
         self.recv.extend_from_slice(bytes);
-        let local = self.local(now);
+        let time = self.time(now);
         let mut delivered = Vec::new();
         while !self.session.disconnect_requested() {
             let len = match frame(&self.recv, FRAME_MAX) {
@@ -171,7 +181,7 @@ impl Host {
             let fields = message.fields();
             let seq = fields.get_u64(tag::MSG_SEQ_NUM).unwrap_or(0);
             let (kind, order) = (message.msg_type().to_vec(), fields.get_u64(ORDER_TAG));
-            if self.session.on_message(local, &message) == Disposition::Deliver {
+            if self.session.on_message_at(time, &message) == Disposition::Deliver {
                 self.stats.delivered += 1;
                 delivered.push(Delivered { seq, kind, order });
             }
@@ -242,13 +252,13 @@ impl Host {
         }
         let pick = rng.index(orders.len());
         let raw = orders[pick].raw.clone();
-        let local = self.local(now);
+        let utc = self.time(now).utc;
         let message = self
             .decoder
             .decode(&raw)
             .map_err(|error| format!("stored order does not decode: {error:?}"))?;
         let mut stamp = [0u8; 21];
-        let time = write_utc_timestamp(local, &mut stamp);
+        let time = write_utc_timestamp(utc, &mut stamp);
         let mut body = self.encoder.start(message.msg_type());
         for (field_tag, value) in message.fields().iter() {
             match field_tag {
@@ -349,5 +359,32 @@ impl Host {
             }
         }
         Ok(recovery)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fix_session::Role;
+
+    use super::*;
+
+    /// A clock step fault moves SendingTime, not the session timers.
+    #[test]
+    fn a_clock_step_moves_the_wall_clock_but_not_the_timers() {
+        let config = Config::new(Role::Initiator, b"FIX.4.4", b"INIT", b"ACCEPT");
+        let mut host = Host::new(config, 0, false);
+        host.connect(START);
+        let deadline = host.deadline();
+        assert!(deadline.is_some());
+        host.skew_ms = -5_000;
+        assert_eq!(host.deadline(), deadline);
+        let later = UtcMillis(START.0 + 10);
+        assert_eq!(
+            host.time(later),
+            SessionTime {
+                elapsed_ms: 10,
+                utc: UtcMillis(START.0 + 10 - 5_000),
+            }
+        );
     }
 }

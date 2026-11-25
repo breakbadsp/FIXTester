@@ -20,10 +20,13 @@ use crate::model::{
     },
     grouped::GroupedOrder,
 };
-use crate::store::{SavedProfile, Store};
+use crate::store::{Reset, SavedProfile, Store};
 use crate::{Result, invalid};
 
 const POLL: Duration = Duration::from_millis(25);
+/// The operator decision that an interrupted reset needs.
+pub const UNCONFIRMED_RESET: &str = "The last reset Logon was not confirmed. The peer may or \
+     may not have reset. Check its next numbers, then reset again or keep the reserved numbers.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -145,6 +148,9 @@ impl Sessions {
             ));
         }
         let checkpoint = store.checkpoint(saved.id)?;
+        if checkpoint.reset == Reset::Unconfirmed {
+            return Err(invalid(UNCONFIRMED_RESET));
+        }
         let open = store.connector();
         let id = saved.id;
         let stop = Arc::new(AtomicBool::new(false));
@@ -191,6 +197,14 @@ impl Sessions {
     pub fn reset(&mut self, store: &Store, id: i64) -> Result<()> {
         self.require_stopped(id)?;
         store.arm_reset(id)?;
+        self.workers.remove(&id);
+        Ok(())
+    }
+
+    /// The operator checked that the peer applied an unconfirmed reset.
+    pub fn keep_reset_numbers(&mut self, store: &Store, id: i64) -> Result<()> {
+        self.require_stopped(id)?;
+        store.keep_reset_numbers(id)?;
         self.workers.remove(&id);
         Ok(())
     }

@@ -27,6 +27,8 @@ tempfile = "3"
 
 [dev-dependencies]
 proptest = "1"
+# The pin publication test runs a purge from the SQLite WAL hook.
+rusqlite = { version = "0.37.0", features = ["bundled", "hooks"] }
 
 [[bin]]
 name = "fixtester"

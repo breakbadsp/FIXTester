@@ -10,7 +10,7 @@ use fix_codec::{Decoder, write_utc_timestamp};
 use fix_dict::Version;
 use fix_session::{Role, State};
 use fixtester_desktop::model::{Application, Order, OrderKind, OrderValues, Profile, now};
-use fixtester_desktop::store::{Direction, Filter, SavedProfile, Store};
+use fixtester_desktop::store::{Direction, Filter, Reset, SavedProfile, Store};
 use fixtester_desktop::transport::{Phase, Send, Sessions};
 
 #[path = "support/wire.rs"]
@@ -294,14 +294,100 @@ fn restart_gap_fill_peer_reset_rejection_and_confirmed_reset() {
     wait(|| !sessions.is_running(id));
     assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 6);
     sessions.reset(&store, id).unwrap();
-    assert!(store.checkpoint(id).unwrap().reset);
+    assert_eq!(store.checkpoint(id).unwrap().reset, Reset::Armed);
     sessions.start(&store, saved.clone()).unwrap();
     let mut wire = connect(&sessions, &saved, Some(&listener));
     handshake(&sessions, id, &mut wire, 1, 1, true);
     let checkpoint = store.checkpoint(id).unwrap();
-    assert!(!checkpoint.reset);
+    assert_eq!(checkpoint.reset, Reset::None);
     assert_eq!(checkpoint.seq.next_sender, 2);
     assert_eq!(checkpoint.seq.next_target, 2);
+}
+
+/// A reset Logon with no reply leaves the peer state unknown. The peer can
+/// have applied the reset and lost its reply, or never seen the Logon.
+#[test]
+fn interrupted_reset_waits_for_the_operator_in_both_peer_outcomes() {
+    for peer_applied_reset in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = reserve();
+        let address = listener.local_addr().unwrap();
+        let (db, store, saved) = setup(
+            dir.path(),
+            profile(Role::Initiator, Version::Fix44, address, 1),
+        );
+        let id = saved.id;
+        let mut sessions = Sessions::default();
+        sessions.reset(&store, id).unwrap();
+        sessions.start(&store, saved.clone()).unwrap();
+        let mut wire = connect(&sessions, &saved, Some(&listener));
+        let logon = wire.receive(b"A", 1);
+        let mut decoder = Decoder::new(256);
+        assert_eq!(
+            decoder.decode(&logon).unwrap().fields().get_bool(141),
+            Some(true)
+        );
+        drop(wire);
+        wait(|| !sessions.is_running(id));
+        drop(sessions);
+        drop(store);
+
+        // The reservation is durable: a new app instance sees it.
+        let store = Store::open(&db).unwrap();
+        let checkpoint = store.checkpoint(id).unwrap();
+        assert_eq!(checkpoint.reset, Reset::Unconfirmed);
+        assert_eq!(
+            (checkpoint.seq.next_sender, checkpoint.seq.next_target),
+            (2, 1)
+        );
+        let mut sessions = Sessions::default();
+        let error = sessions.start(&store, saved.clone()).unwrap_err();
+        assert!(error.to_string().contains("not confirmed"), "{error}");
+        assert!(!sessions.is_running(id));
+        assert_eq!(store.checkpoint(id).unwrap().reset, Reset::Unconfirmed);
+
+        if peer_applied_reset {
+            // The peer sent Logon 34=1 and it was lost.
+            sessions.keep_reset_numbers(&store, id).unwrap();
+            sessions.start(&store, saved.clone()).unwrap();
+            let mut wire = connect(&sessions, &saved, Some(&listener));
+            let logon = wire.receive(b"A", 2);
+            assert_eq!(
+                decoder.decode(&logon).unwrap().fields().get_bool(141),
+                Some(false)
+            );
+            wire.logon(2, false);
+            let resend = wire.receive(b"2", 3);
+            assert_eq!(
+                decoder.decode(&resend).unwrap().fields().get_u64(7),
+                Some(1)
+            );
+            let mut timestamp = [0; 21];
+            wire.send(
+                b"4",
+                1,
+                &[
+                    (123, b"Y"),
+                    (36, b"3"),
+                    (43, b"Y"),
+                    (122, write_utc_timestamp(now(), &mut timestamp)),
+                ],
+            );
+            wait(|| store.checkpoint(id).unwrap().seq.next_target == 3);
+            assert_eq!(store.checkpoint(id).unwrap().seq.next_sender, 4);
+        } else {
+            sessions.reset(&store, id).unwrap();
+            sessions.start(&store, saved.clone()).unwrap();
+            let mut wire = connect(&sessions, &saved, Some(&listener));
+            handshake(&sessions, id, &mut wire, 1, 1, true);
+            let checkpoint = store.checkpoint(id).unwrap();
+            assert_eq!(
+                (checkpoint.seq.next_sender, checkpoint.seq.next_target),
+                (2, 2)
+            );
+        }
+        assert_eq!(store.checkpoint(id).unwrap().reset, Reset::None);
+    }
 }
 
 #[test]
@@ -365,12 +451,12 @@ fn acceptor_requires_armed_reset_and_reconnects_after_heartbeat_timeout() {
         std::io::Read::read(&mut wrong_peer.stream, &mut bytes).unwrap(),
         0
     );
-    assert!(store.checkpoint(id).unwrap().reset);
+    assert_eq!(store.checkpoint(id).unwrap().reset, Reset::Armed);
     assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 1);
 
     let mut peer = connect(&sessions, &saved, None);
     handshake(&sessions, id, &mut peer, 1, 1, true);
-    assert!(!store.checkpoint(id).unwrap().reset);
+    assert_eq!(store.checkpoint(id).unwrap().reset, Reset::None);
     peer.receive(b"0", 2);
     let test = peer.receive(b"1", 3);
     let mut decoder = Decoder::new(256);

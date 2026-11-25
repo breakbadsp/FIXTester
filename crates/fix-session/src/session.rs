@@ -443,9 +443,15 @@ impl Session {
             self.on_sequence_reset(now, kind, &fields, seq);
             return Disposition::Drop;
         }
-        if kind == msg_type::RESEND_REQUEST && seq >= self.seq.next_target {
-            // A ResendRequest is answered even when its MsgSeqNum is too high.
-            self.on_resend_request(now, &fields, seq);
+        if seq >= self.seq.next_target {
+            // A ResendRequest is answered, and the reply to a TestRequest
+            // ends the TestRequest, also when MsgSeqNum is too high. Neither
+            // moves the expected MsgSeqNum.
+            if kind == msg_type::RESEND_REQUEST {
+                self.on_resend_request(now, &fields, seq);
+            } else if kind == msg_type::HEARTBEAT && self.answers_test_request(&fields) {
+                self.test_request = None;
+            }
         }
         if !self.sequence_is_next(now, &fields, seq) {
             return Disposition::Drop;
@@ -590,6 +596,16 @@ impl Session {
         if fields.get_u64(tag::ENCRYPT_METHOD) != Some(0) {
             return Some(b"EncryptMethod must be 0");
         }
+        // A reset Logon has MsgSeqNum 1, and a reset completes only when the
+        // acceptor confirms it with ResetSeqNumFlag=Y (FIX session layer
+        // 4.4.2). Whether a peer may reset is a decision of the host.
+        let reset = fields.get_bool(tag::RESET_SEQ_NUM_FLAG) == Some(true);
+        if reset && fields.get_u64(tag::MSG_SEQ_NUM) != Some(1) {
+            return Some(b"Logon with ResetSeqNumFlag=Y needs MsgSeqNum=1");
+        }
+        if self.config.role == Role::Initiator && self.reset_requested && !reset {
+            return Some(b"Logon reply to a reset needs ResetSeqNumFlag=Y and MsgSeqNum=1");
+        }
         let heartbeat_valid = fields
             .get_u64(tag::HEART_BT_INT)
             .is_some_and(|value| (1..=HEART_BT_INT_MAX_S).contains(&value));
@@ -645,13 +661,6 @@ impl Session {
         }
         self.advance_target(seq + 1);
         match kind {
-            msg_type::HEARTBEAT => {
-                let id = fields.get_u64(tag::TEST_REQ_ID);
-                if id.is_some() && id == self.test_request.map(|(sent, _)| sent) {
-                    self.test_request = None;
-                }
-                Disposition::Drop
-            }
             msg_type::TEST_REQUEST => {
                 self.on_test_request(now, fields, seq);
                 Disposition::Drop
@@ -673,9 +682,19 @@ impl Session {
                 );
                 Disposition::Drop
             }
-            msg_type::RESEND_REQUEST => Disposition::Drop,
+            msg_type::HEARTBEAT | msg_type::RESEND_REQUEST => Disposition::Drop,
             _ => Disposition::Deliver,
         }
+    }
+
+    /// True when TestReqID is the exact decimal text of the open TestRequest.
+    fn answers_test_request(&self, fields: &Fields) -> bool {
+        let Some((id, _)) = self.test_request else {
+            return false;
+        };
+        fields.get(tag::TEST_REQ_ID).is_some_and(|echo| {
+            fix_codec::parse_u64(echo) == Some(id) && (echo.len() == 1 || echo[0] != b'0')
+        })
     }
 
     fn on_test_request(&mut self, now: SessionTime, fields: &Fields, seq: u64) {

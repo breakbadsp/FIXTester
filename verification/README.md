@@ -11,8 +11,8 @@ Run executable checks against Rust for wire values and UI behavior.
 | Dictionary generator XML, reference resolution, and output | Keep XML and resolution fixtures and the pinned regeneration input. The generator has no runtime peer input. |
 | Dictionary versions, schema, group reach, value rules, validation reports, and defaults | Keep tests for each supported version and the field, group, default, and value tables. |
 | Venue profile parsing, field and message overrides, group resolution, cycle checks, and CLI | Keep the valid and invalid TOML fixtures and CLI tests. |
-| Session Logon and Logout, receive sequence, gap fill, resend, heartbeat, timeout, and reconnect | Create a bounded session receive model. Keep the Rust timer and FIX transition fixtures. Replay a recovery sequence through the public Rust API. |
-| Simulator clock, seeded plan, delivery pipe, and two session hosts | Run the default seed range once to check both recovery and fault coverage. Keep replay and lost-recovery-packet tests. |
+| Session Logon and Logout, receive sequence, gap fill, resend, heartbeat, timeout, and reconnect | Keep the bounded receive model with an independent peer. FIXSim uses the same file. Keep the Rust timer and FIX transition fixtures. Replay the recovery and TestRequest paths through the public Rust API. |
+| Simulator clock, seeded plan, delivery pipe, and two session hosts | Run the default seed range once to check both recovery and fault coverage. Each host gives the session a monotonic elapsed clock and a skewed UTC clock, so a clock step changes SendingTime and not the timers. Keep replay and lost-recovery-packet tests. |
 | Desktop profile and worker lifecycle, socket framing, and TCP dispatch | Keep real loopback for roles, versions, concurrent sessions, checksum recovery, and reset. |
 | Desktop SQLite locks, migration, checkpoints, retention, quota, WAL, and export | Keep the send durability model and the storage tests with independent connections, failed writes, and reopen. |
 | Order and report construction, grouped legs and lists, references, and additional tags | Keep the version/action tables and validation and wire cases. |

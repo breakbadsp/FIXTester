@@ -86,7 +86,43 @@ pub struct SavedProfile {
 #[derive(Debug, Clone, Copy)]
 pub struct Checkpoint {
     pub seq: SequenceNumbers,
-    pub reset: bool,
+    pub reset: Reset,
+}
+
+/// The state of an operator sequence reset. The `reset` column stores it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Reset {
+    #[default]
+    None,
+    /// The operator confirmed a reset to 1. The next Logon in each direction
+    /// must have ResetSeqNumFlag=Y and MsgSeqNum=1.
+    Armed,
+    /// The initiator reserved its reset Logon, but no valid reply arrived.
+    /// A missing reply does not show whether the peer applied the reset, so
+    /// the operator must check the peer before the next connection.
+    Unconfirmed,
+}
+
+impl rusqlite::ToSql for Reset {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        let stored: i64 = match self {
+            Self::None => 0,
+            Self::Armed => 1,
+            Self::Unconfirmed => 2,
+        };
+        Ok(stored.into())
+    }
+}
+
+impl rusqlite::types::FromSql for Reset {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match i64::column_result(value)? {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Armed),
+            2 => Ok(Self::Unconfirmed),
+            other => Err(rusqlite::types::FromSqlError::OutOfRange(other)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,11 +404,26 @@ impl Store {
     pub(crate) fn arm_reset(&self, id: i64) -> Result<()> {
         let tx = self.write_transaction()?;
         let updated = tx.execute(
-            "UPDATE profile SET next_send=1,next_receive=1,reset=1 WHERE id=?1",
-            [id],
+            "UPDATE profile SET next_send=1,next_receive=1,reset=?1 WHERE id=?2",
+            params![Reset::Armed, id],
         )?;
         if updated != 1 {
             return Err(invalid("Select a saved profile."));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records the operator decision that the peer applied an unconfirmed
+    /// reset. The session keeps the reserved sequence numbers.
+    pub(crate) fn keep_reset_numbers(&self, id: i64) -> Result<()> {
+        let tx = self.write_transaction()?;
+        let updated = tx.execute(
+            "UPDATE profile SET reset=?1 WHERE id=?2 AND reset=?3",
+            params![Reset::None, id, Reset::Unconfirmed],
+        )?;
+        if updated != 1 {
+            return Err(invalid("No unconfirmed reset is waiting for this profile."));
         }
         tx.commit()?;
         Ok(())
