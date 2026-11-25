@@ -36,9 +36,12 @@ The FIX version and CompID pair identify a saved session. To use a
 different identity, add a profile. To reset a session, stop it, select
 **Reset sequences…**, and confirm **Reset to 1**. Arrange for the peer
 to send or echo `141=Y` and `34=1` in the next Logon. The initiator
-reserves its reset Logon before it tries to write it. If that exchange
-is interrupted, verify the peer's numbers before you confirm another
-reset. A reset keeps the old message history.
+reserves its reset Logon before it tries to write it. If no valid reply
+arrives, the profile shows that the reset is not confirmed, and
+**Connect** stays blocked: the peer may or may not have reset. Ask the
+peer for its next numbers. Open **Reset sequences…** and select **Keep
+reserved numbers** if the peer applied the reset, or **Reset to 1** to
+send a new reset Logon. A reset keeps the old message history.
 
 Use a test peer on a trusted network. The application does not require
 a FIXSim process, a database server, or an Internet connection.

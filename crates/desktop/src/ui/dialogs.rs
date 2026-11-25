@@ -13,7 +13,7 @@ use fix_session::Role;
 use fixtester_desktop::model::{
     Application, FIELDS_MAX, MESSAGE_MAX, Order, OrderKind, OrderValues, Profile,
 };
-use fixtester_desktop::store::{Direction, SavedProfile};
+use fixtester_desktop::store::{Direction, Reset, SavedProfile};
 use fixtester_desktop::transport::Send;
 use fixtester_desktop::{Result, invalid};
 
@@ -425,21 +425,40 @@ impl Workspace {
     }
 
     fn reset_dialog(&mut self, ui: &mut egui::Ui, id: i64) -> bool {
+        let unconfirmed = self
+            .store
+            .checkpoint(id)
+            .is_ok_and(|checkpoint| checkpoint.reset == Reset::Unconfirmed);
         ui.heading("Reset sequence numbers?");
+        if unconfirmed {
+            ui.label("The peer did not confirm the last reset Logon. If the peer applied that reset, keep the reserved numbers. If not, reset to 1 again.");
+            if ui.button("Keep reserved numbers").clicked() {
+                let kept = self.sessions.keep_reset_numbers(&self.store, id);
+                return self.finish_reset(id, kept);
+            }
+        }
         ui.label("This sets the next send and receive numbers to 1. Set up the peer to use ResetSeqNumFlag=Y on the next Logon.");
         match submit(ui, "Reset to 1") {
             Some(false) => false,
-            Some(true) => match self.sessions.reset(&self.store, id) {
-                Ok(()) => {
-                    self.disarm_automation(id);
-                    false
-                }
-                Err(error) => {
-                    self.notice = error.to_string();
-                    true
-                }
-            },
+            Some(true) => {
+                let reset = self.sessions.reset(&self.store, id);
+                self.finish_reset(id, reset)
+            }
             None => true,
+        }
+    }
+
+    /// Returns true to keep the dialog open after an error.
+    fn finish_reset(&mut self, id: i64, result: Result<()>) -> bool {
+        match result {
+            Ok(()) => {
+                self.disarm_automation(id);
+                false
+            }
+            Err(error) => {
+                self.notice = error.to_string();
+                true
+            }
         }
     }
 

@@ -15,8 +15,8 @@ use fix_dict::Version;
 use fix_session::{Role, State};
 use fixtester_desktop::Result;
 use fixtester_desktop::model::{OrderKind, SESSIONS_MAX, execution::automation::Settings};
-use fixtester_desktop::store::{Entry, Filter, SavedProfile, Store};
-use fixtester_desktop::transport::{Phase, Sessions, Status};
+use fixtester_desktop::store::{Entry, Filter, Reset, SavedProfile, Store};
+use fixtester_desktop::transport::{Phase, Sessions, Status, UNCONFIRMED_RESET};
 
 use dialogs::{Dialog, ProfileDraft};
 
@@ -128,10 +128,10 @@ impl Workspace {
             Some(Status {
                 phase: Phase::Stopped,
                 seq: checkpoint.seq,
-                notice: if checkpoint.reset {
-                    "Sequence reset armed.".into()
-                } else {
-                    String::new()
+                notice: match checkpoint.reset {
+                    Reset::None => String::new(),
+                    Reset::Armed => "Sequence reset armed.".into(),
+                    Reset::Unconfirmed => UNCONFIRMED_RESET.into(),
                 },
                 ..Status::default()
             })

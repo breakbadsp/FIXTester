@@ -27,7 +27,7 @@ fn append(store: &mut Store, id: i64, time: UtcMillis, raw: &[u8], sequence: u64
                     next_sender: sequence,
                     next_target: sequence,
                 },
-                reset: false,
+                reset: Reset::None,
             },
             received: Some(Packet {
                 raw,
@@ -162,7 +162,7 @@ fn hard_admission_and_soft_maintenance_remove_oldest_without_resetting_state() {
     assert_eq!(stored_bytes(&store, id), [b"row00004", b"row00003"]);
     assert_eq!(store.checkpoint(id).unwrap().seq.next_sender, 5);
     assert_eq!(store.checkpoint(id).unwrap().seq.next_target, 5);
-    assert!(store.checkpoint(other).unwrap().reset);
+    assert_eq!(store.checkpoint(other).unwrap().reset, Reset::Armed);
     assert_eq!(store.profiles().unwrap().len(), 2);
 }
 
@@ -229,7 +229,7 @@ fn version_zero_migration_charges_existing_rows_and_preserves_checkpoints() {
         let checkpoint = store.checkpoint(1).unwrap();
         assert_eq!(checkpoint.seq.next_sender, 88);
         assert_eq!(checkpoint.seq.next_target, 93);
-        assert!(checkpoint.reset);
+        assert_eq!(checkpoint.reset, Reset::Armed);
     }
 }
 
@@ -356,6 +356,74 @@ fn in_flight_rows_survive_retention_and_quota_from_another_connection() {
     assert!(sender.finish_write(-1, 0, false).is_err());
 }
 
+/// An age purge on another connection, and its result after the next WAL
+/// commit on this thread.
+#[derive(Default)]
+struct PurgeAfterCommit {
+    other: Option<(Store, u64)>,
+    result: Option<Result<bool>>,
+}
+
+thread_local! {
+    static PURGE_AFTER_COMMIT: std::cell::RefCell<PurgeAfterCommit> =
+        std::cell::RefCell::default();
+}
+
+/// SQLite calls the WAL hook after a commit releases the write lock and
+/// before `Store::commit` returns: the first moment another connection can
+/// purge the new rows.
+#[allow(clippy::unnecessary_wraps)] // The type of a rusqlite WAL hook.
+fn purge_after_commit(_: &rusqlite::hooks::Wal, _: std::ffi::c_int) -> rusqlite::Result<()> {
+    PURGE_AFTER_COMMIT.with_borrow_mut(|purge| {
+        if let Some((other, cutoff)) = &purge.other {
+            purge.result = Some(other.purge_before(*cutoff));
+        }
+    });
+    Ok(())
+}
+
+/// `LiveRowsSurvive`: `Store::commit` pins its outgoing rows before the
+/// commit makes them visible to a purge on another connection.
+#[test]
+fn outgoing_rows_are_pinned_before_the_commit_releases_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("publication.db");
+    let mut sender = Store::open_with_limits(&path, SMALL).unwrap();
+    let other = sender.connector()().unwrap();
+    let id = sender.save_profile(None, &profile(1)).unwrap();
+    let time = now();
+    PURGE_AFTER_COMMIT.set(PurgeAfterCommit {
+        other: Some((other, time.0 + 1)),
+        result: None,
+    });
+    sender.connection.wal_hook(Some(purge_after_commit));
+    let pending = sender
+        .commit(
+            id,
+            &Transition {
+                time,
+                checkpoint: sender.checkpoint(id).unwrap(),
+                received: None,
+                outgoing: &[b"pending1"],
+                values: None,
+            },
+        )
+        .unwrap();
+    sender.connection.wal_hook(None);
+    let purge = PURGE_AFTER_COMMIT.take();
+    assert!(
+        purge.result.unwrap().unwrap(),
+        "the purge ran after the commit"
+    );
+    assert_eq!(stored_bytes(&sender, id), [b"pending1"]);
+
+    // The same purge removes the row when it has no pin.
+    drop(pending);
+    let (other, cutoff) = purge.other.unwrap();
+    assert!(other.purge_before(cutoff).unwrap());
+    assert_eq!(stored_bytes(&sender, id).len(), 0);
+}
+
 #[test]
 fn interrupted_send_is_not_pinned_after_the_app_reopens() {
     let dir = tempfile::tempdir().unwrap();
@@ -447,7 +515,7 @@ fn full_legacy_database_reclaims_history_pages_before_quota_setup() {
         let saved = store.checkpoint(1).unwrap();
         assert_eq!(saved.seq.next_sender, 21);
         assert_eq!(saved.seq.next_target, 51);
-        assert!(saved.reset);
+        assert_eq!(saved.reset, Reset::Armed);
         assert_eq!(store.profiles().unwrap()[0].profile.name, "Old profile");
     }
 }

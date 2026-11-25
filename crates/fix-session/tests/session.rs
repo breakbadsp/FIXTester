@@ -310,6 +310,79 @@ fn acceptor_with_reset_flag_restarts_both_sequences() {
     );
 }
 
+/// Fields after the standard header, for a table of test cases.
+type ExtraFields = &'static [(u32, &'static str)];
+
+/// FIX session layer: a Logon with ResetSeqNumFlag=Y has MsgSeqNum 1, and
+/// the reply to a reset Logon also has ResetSeqNumFlag=Y.
+#[test]
+fn a_reset_logon_needs_msg_seq_num_1_and_a_requested_reset_needs_141_y() {
+    let numbers = SequenceNumbers {
+        next_sender: 7,
+        next_target: 9,
+    };
+    // Role, reset requested, Logon MsgSeqNum, and the extra Logon fields.
+    let refused: [(Role, bool, u64, ExtraFields); 6] = [
+        (Role::Acceptor, false, 9, &[(141, "Y")]),
+        (Role::Acceptor, false, 2, &[(141, "Y")]),
+        (Role::Initiator, false, 9, &[(141, "Y")]),
+        (Role::Initiator, true, 8, &[]),
+        (Role::Initiator, true, 8, &[(141, "Y")]),
+        (Role::Initiator, true, 1, &[]),
+    ];
+    for (role, reset, seq, extra) in refused {
+        let case = format!("{role:?} reset={reset} 34={seq} {extra:?}");
+        let mut config = config(role, V44);
+        config.reset_on_logon = reset;
+        let mut session = Session::new(config, numbers);
+        session.on_connected(T0);
+        drain(&mut session);
+        events(&mut session);
+        let mut fields = vec![(98, "0"), (108, "30")];
+        fields.extend_from_slice(extra);
+        feed(&mut session, T0, &from_peer("A", seq, T0, &fields));
+        assert_eq!(
+            events(&mut session),
+            vec![Event::DisconnectRequested(DisconnectReason::BadLogon)],
+            "{case}"
+        );
+        let logout = drain(&mut session);
+        assert_eq!(kinds(&logout), ["5"], "{case}");
+        assert!(
+            logout[0]
+                .get(58)
+                .is_some_and(|text| text.contains("ResetSeqNumFlag")),
+            "{case}"
+        );
+        let target = if reset { 1 } else { numbers.next_target };
+        assert_eq!(session.sequence_numbers().next_target, target, "{case}");
+    }
+}
+
+/// Whether a peer can reset without a request is a venue or operator
+/// decision. The session accepts a valid unrequested reset and leaves that
+/// decision to the host.
+#[test]
+fn an_unrequested_reset_reply_with_msg_seq_num_1_is_left_to_the_host() {
+    let numbers = SequenceNumbers {
+        next_sender: 7,
+        next_target: 9,
+    };
+    let mut session = Session::new(config(Role::Initiator, V44), numbers);
+    session.on_connected(T0);
+    drain(&mut session);
+    let reply = from_peer("A", 1, T0, &[(98, "0"), (108, "30"), (141, "Y")]);
+    feed(&mut session, T0, &reply);
+    assert_eq!(session.state(), State::Active);
+    assert_eq!(
+        session.sequence_numbers(),
+        SequenceNumbers {
+            next_sender: 8,
+            next_target: 2
+        }
+    );
+}
+
 #[test]
 fn logon_with_a_lower_sequence_than_expected_is_refused() {
     let mut session = Session::new(
@@ -488,6 +561,66 @@ fn heartbeat_with_the_matching_test_req_id_clears_the_test_request() {
 
     assert!(!session.disconnect_requested());
     assert_eq!(session.state(), State::Active);
+}
+
+#[test]
+fn matching_heartbeat_above_a_gap_answers_the_test_request_without_skipping() {
+    let (mut session, id) = silent_peer_session();
+    let at = UtcMillis(T0.0 + 37_000);
+
+    // MsgSeqNum 2 was lost. The reply to the TestRequest arrives as 3.
+    let reply = from_peer("0", 3, at, &[(112, &id)]);
+    assert_eq!(feed(&mut session, at, &reply), Disposition::Drop);
+    assert_eq!(session.sequence_numbers().next_target, 2);
+    let resend = drain(&mut session);
+    assert_eq!(kinds(&resend), ["2"]);
+    assert_eq!((resend[0].num(7), resend[0].num(16)), (Some(2), Some(0)));
+
+    session.on_timer(UtcMillis(T0.0 + 36_000 + HB));
+    assert!(!session.disconnect_requested());
+    assert_eq!(session.state(), State::Active);
+
+    // The peer gap-fills 2 and 3: the heartbeat keeps its MsgSeqNum.
+    let fill = from_peer("4", 2, at, &[(123, "Y"), (36, "4")]);
+    feed(&mut session, at, &fill);
+    assert_eq!(session.sequence_numbers().next_target, 4);
+    assert!(events(&mut session).contains(&Event::GapClosed));
+}
+
+#[test]
+fn only_a_valid_matching_heartbeat_at_or_above_expected_answers_the_test_request() {
+    let late = UtcMillis(T0.0 + 37_000);
+    let orig = timestamp(T0);
+    // "ID" stands for the TestReqID that the session sent, "ORIG" for T0.
+    let cases: [(&str, u64, ExtraFields); 7] = [
+        ("0", 3, &[(112, "WRONG")]),
+        ("0", 3, &[]),
+        ("0", 3, &[(112, "0ID")]),
+        ("D", 3, &[(11, "A"), (112, "ID")]),
+        // A Boolean header flag that is not Y or N: the header is not valid.
+        ("0", 3, &[(112, "ID"), (97, "X")]),
+        ("0", 2, &[(112, "ID"), (97, "X")]),
+        // Too low, with PossDupFlag=Y: dropped by the low-sequence rule.
+        ("0", 1, &[(112, "ID"), (43, "Y"), (122, "ORIG")]),
+    ];
+    for (kind, seq, fields) in cases {
+        let (mut session, id) = silent_peer_session();
+        let fields: Vec<(u32, String)> = fields
+            .iter()
+            .map(|(tag, value)| (*tag, value.replace("ID", &id).replace("ORIG", &orig)))
+            .collect();
+        let fields: Vec<(u32, &str)> = fields.iter().map(|(t, v)| (*t, v.as_str())).collect();
+        feed(&mut session, late, &from_peer(kind, seq, late, &fields));
+        assert!(session.sequence_numbers().next_target <= 3, "{kind} {seq}");
+        session.on_timer(UtcMillis(T0.0 + 36_000 + HB));
+        assert_eq!(
+            events(&mut session).last(),
+            Some(&Event::DisconnectRequested(
+                DisconnectReason::HeartbeatTimeout
+            )),
+            "{kind} {seq} {fields:?}"
+        );
+    }
 }
 
 #[test]

@@ -11,7 +11,7 @@ use crate::model::{
     execution::automation::{Automation, Plan, SKIPPED},
     now,
 };
-use crate::store::{Checkpoint, Direction, Packet, SavedProfile, Store, Transition};
+use crate::store::{Checkpoint, Direction, Packet, Reset, SavedProfile, Store, Transition};
 use crate::{Error, Result, invalid};
 
 const CHUNK: usize = 8192;
@@ -23,8 +23,10 @@ struct Peer<'a> {
     stream: TcpStream,
     epoch: Instant,
     session: Session,
+    /// The peer Logon must have ResetSeqNumFlag=Y: the operator armed a reset.
     reset_expected: bool,
-    reset_armed: bool,
+    /// The reset state that each commit stores with the sequence numbers.
+    reset: Reset,
     decoder: Decoder,
     input: Vec<u8>,
     output: Vec<u8>,
@@ -45,6 +47,11 @@ pub(super) fn connect(
     stream.set_nodelay(true)?;
     let profile = &saved.profile;
     let checkpoint = store.checkpoint(saved.id)?;
+    if checkpoint.reset == Reset::Unconfirmed {
+        return Err(invalid(super::UNCONFIRMED_RESET));
+    }
+    let armed = checkpoint.reset == Reset::Armed;
+    let sends_reset = armed && profile.role == Role::Initiator;
     let mut config = Config::new(
         profile.role,
         profile.version.begin_string().as_bytes(),
@@ -52,7 +59,7 @@ pub(super) fn connect(
         profile.target.as_bytes(),
     );
     config.heartbeat_interval_ms = u64::from(profile.heartbeat) * 1000;
-    config.reset_on_logon = checkpoint.reset && profile.role == Role::Initiator;
+    config.reset_on_logon = sends_reset;
     config.logout_timeout_ms = 1500;
     config.message_len_max = MESSAGE_MAX;
     config.output_len_max = 4 * MESSAGE_MAX;
@@ -60,8 +67,14 @@ pub(super) fn connect(
         stream,
         epoch: Instant::now(),
         session: Session::new(config, checkpoint.seq),
-        reset_expected: checkpoint.reset,
-        reset_armed: checkpoint.reset && profile.role == Role::Acceptor,
+        reset_expected: armed,
+        // The first commit of an initiator reserves its reset Logon. Until a
+        // valid reply arrives, the outcome at the peer is not known.
+        reset: if sends_reset {
+            Reset::Unconfirmed
+        } else {
+            checkpoint.reset
+        },
         decoder: Decoder::new(FIELDS_MAX),
         input: Vec::with_capacity(MESSAGE_MAX + CHUNK),
         output: Vec::new(),
@@ -205,7 +218,7 @@ impl Peer<'_> {
         .then(|| self.session.sequence_numbers().next_target);
         let disposition = self.session.on_message_at(time, &message);
         if self.session.state() == State::Active {
-            self.reset_armed = false;
+            self.reset = Reset::None;
         }
         let plan = match &mut self.automation {
             Some(automation)
@@ -377,7 +390,7 @@ impl Peer<'_> {
                     time,
                     checkpoint: Checkpoint {
                         seq,
-                        reset: self.reset_armed,
+                        reset: self.reset,
                     },
                     outgoing: &outgoing,
                     received: received.map(|(raw, status)| Packet {
@@ -451,18 +464,21 @@ fn check_receive(state: State, reset_expected: bool, message: &Message<'_>) -> R
             ));
         }
     }
+    // The operator decides whether a reset may occur. The session checks the
+    // reset handshake: MsgSeqNum=1, and ResetSeqNumFlag=Y in a reply.
     if message.msg_type() == tag::msg_type::LOGON
         && matches!(state, State::LogonSent | State::AwaitingLogon)
     {
-        let reset = fields.get_bool(tag::RESET_SEQ_NUM_FLAG);
-        if reset != Some(reset_expected)
-            || (reset_expected && fields.get_u64(tag::MSG_SEQ_NUM) != Some(1))
-        {
-            return Err(invalid(if reset_expected {
-                "The reset Logon requires ResetSeqNumFlag=Y and MsgSeqNum=1."
-            } else {
-                "The peer requested a reset. Stop the session and confirm a coordinated reset."
-            }));
+        let reset = fields.get_bool(tag::RESET_SEQ_NUM_FLAG) == Some(true);
+        if reset && !reset_expected {
+            return Err(invalid(
+                "The peer requested a reset. Stop the session and confirm a coordinated reset.",
+            ));
+        }
+        if !reset && reset_expected && state == State::AwaitingLogon {
+            return Err(invalid(
+                "The armed reset requires a peer Logon with ResetSeqNumFlag=Y.",
+            ));
         }
     }
     Ok(())
@@ -542,52 +558,62 @@ mod tests {
         }
     }
 
+    /// A reset Logon that SQLite cannot reserve does not reach TCP, and the
+    /// reset stays armed: the peer cannot have seen it.
     #[test]
     fn failed_reservation_sends_no_logon() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let mut store = Store::open(&path).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let profile = Profile {
-            name: "Failed Logon reservation".into(),
-            version: Version::Fix44,
-            role: Role::Initiator,
-            sender: "TEST".into(),
-            target: "PEER".into(),
-            address: listener.local_addr().unwrap(),
-            heartbeat: 30,
-        };
-        let id = store.save_profile(None, &profile).unwrap();
-        let database = rusqlite::Connection::open(path).unwrap();
-        database
-            .execute_batch(
-                "CREATE TRIGGER fail_reservation BEFORE INSERT ON history
-                 BEGIN SELECT raise(ABORT, 'test reservation failure'); END;",
-            )
-            .unwrap();
-        let stream = TcpStream::connect(profile.address).unwrap();
-        let (mut other, _) = listener.accept().unwrap();
-        other
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let (_commands, receiver) = mpsc::channel();
-        let control = Control {
-            stop: Arc::new(AtomicBool::new(false)),
-            status: Arc::new(Mutex::new(super::super::Status::default())),
-            commands: receiver,
-            rules: None,
-        };
-        let error =
-            connect(stream, &mut store, &SavedProfile { id, profile }, &control).unwrap_err();
-        assert!(error.to_string().contains("test reservation failure"));
-        assert_eq!(other.read(&mut [0]).unwrap(), 0, "Logon reached TCP");
-        assert_eq!(store.checkpoint(id).unwrap().seq.next_sender, 1);
-        assert!(
-            store
-                .history(id, &Filter::default(), None)
-                .unwrap()
-                .is_empty()
-        );
+        for armed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let mut store = Store::open(&path).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let profile = Profile {
+                name: "Failed Logon reservation".into(),
+                version: Version::Fix44,
+                role: Role::Initiator,
+                sender: "TEST".into(),
+                target: "PEER".into(),
+                address: listener.local_addr().unwrap(),
+                heartbeat: 30,
+            };
+            let id = store.save_profile(None, &profile).unwrap();
+            if armed {
+                store.arm_reset(id).unwrap();
+            }
+            let before = store.checkpoint(id).unwrap();
+            let database = rusqlite::Connection::open(path).unwrap();
+            database
+                .execute_batch(
+                    "CREATE TRIGGER fail_reservation BEFORE INSERT ON history
+                     BEGIN SELECT raise(ABORT, 'test reservation failure'); END;",
+                )
+                .unwrap();
+            let stream = TcpStream::connect(profile.address).unwrap();
+            let (mut other, _) = listener.accept().unwrap();
+            other
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let (_commands, receiver) = mpsc::channel();
+            let control = Control {
+                stop: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(Mutex::new(super::super::Status::default())),
+                commands: receiver,
+                rules: None,
+            };
+            let error =
+                connect(stream, &mut store, &SavedProfile { id, profile }, &control).unwrap_err();
+            assert!(error.to_string().contains("test reservation failure"));
+            assert_eq!(other.read(&mut [0]).unwrap(), 0, "Logon reached TCP");
+            let after = store.checkpoint(id).unwrap();
+            assert_eq!((after.seq, after.reset), (before.seq, before.reset));
+            assert_eq!(after.reset == Reset::Armed, armed);
+            assert!(
+                store
+                    .history(id, &Filter::default(), None)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -616,7 +642,7 @@ mod tests {
                             next_sender: 12,
                             next_target: 5,
                         },
-                        reset: false,
+                        reset: Reset::None,
                     },
                     received: None,
                     outgoing: &[raw],

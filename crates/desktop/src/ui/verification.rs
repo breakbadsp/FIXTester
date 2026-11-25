@@ -237,11 +237,23 @@ fn connected_workspace_version(path: &Path, version: Version) -> (Driver, Wire) 
     ui.click("Save profile");
     ui.wait_for_workspace();
     ui.key(Key::F5, Modifiers::NONE);
-    addr.set_nonblocking(true).unwrap();
+    let mut peer = Wire::new(accept(&addr), &profile);
+    peer.receive(b"A", 1);
+    peer.logon(1, false);
+    ui.wait_for(accesskit::Role::Label, "Logon complete.");
+    (ui, peer)
+}
+
+/// Accepts the connection of the selected initiator profile.
+fn accept(listener: &TcpListener) -> std::net::TcpStream {
+    listener.set_nonblocking(true).unwrap();
     let start = Instant::now();
-    let socket = loop {
-        match addr.accept() {
-            Ok((stream, _)) => break stream,
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     start.elapsed() < Duration::from_secs(4),
@@ -251,12 +263,40 @@ fn connected_workspace_version(path: &Path, version: Version) -> (Driver, Wire) 
             }
             Err(error) => panic!("{error}"),
         }
-    };
-    let mut peer = Wire::new(socket, &profile);
+    }
+}
+
+/// The operator chooses after a reset Logon that got no reply.
+#[test]
+fn unconfirmed_reset_blocks_connect_until_the_operator_keeps_the_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, peer) = connected_workspace(&dir.path().join("reset.db"));
+    let profile = peer.profile.clone();
+    drop(peer);
+    ui.wait_for(accesskit::Role::Button, "Connect");
+    ui.click("Reset sequences");
+    ui.click("Reset to 1");
+    ui.wait_for_workspace();
+    let listener = TcpListener::bind(profile.address).unwrap();
+    ui.key(Key::F5, Modifiers::NONE);
+    let mut peer = Wire::new(accept(&listener), &profile);
     peer.receive(b"A", 1);
-    peer.logon(1, false);
-    ui.wait_for(accesskit::Role::Label, "Logon complete.");
-    (ui, peer)
+    drop(peer);
+    ui.wait_for(accesskit::Role::Button, "Connect");
+
+    ui.key(Key::F5, Modifiers::NONE);
+    ui.wait_for(accesskit::Role::Label, "not confirmed");
+    ui.click("Reset sequences");
+    ui.click("Keep reserved numbers");
+    ui.wait_for_workspace();
+    ui.key(Key::F5, Modifiers::NONE);
+    let mut peer = Wire::new(accept(&listener), &profile);
+    let logon = peer.receive(b"A", 2);
+    let mut decoder = Decoder::new(64);
+    assert_eq!(
+        decoder.decode(&logon).unwrap().fields().get_bool(141),
+        Some(false)
+    );
 }
 
 #[test]
